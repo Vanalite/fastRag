@@ -7,7 +7,10 @@ _Last updated: 2026-10-22_
 ## Context
 
 - **Product:** fastRag, a retrieval service for small and medium-sized businesses that plugs into agent platforms.
-- **First consumer:** our own business agent, built on top of fastRag. The agent owns the LLM, guardrails, settings, refusal and hand-off to a human.
+- **First consumer:** our own agent backend, which runs in the cloud and owns the LLM, guardrails, settings, refusal and hand-off to a human. Three surfaces sit on top of it, and all three use fastRag:
+  1. **Customer AI agent:** the real-estate company's customers chat with the AI.
+  2. **Hand-off inbox (admin dashboard):** sales or support staff take over conversations from the AI.
+  3. **Internal knowledge (admin dashboard):** sales staff look up internal documents for selling and advertising.
 - **Pilot client:** a Vietnamese real-estate business.
   - About 99% of content and customer questions are in Vietnamese; 1% English.
   - Documents are PDFs, web pages, and many spreadsheets.
@@ -22,8 +25,16 @@ _Last updated: 2026-10-22_
 - **Rule:** the graph ships only where our quality checks show it beats hybrid retrieval. If it costs more than it delivers, drop it and keep plain hybrid RAG.
 - **Most promising place for the graph:** the address and project hierarchy (city → district → ward → project → unit).
 
-### D2. v1 serves customer-service chat first
-- **Speed target:** retrieval in roughly 300 ms or less; first useful output to the customer in about 1–2 seconds.
+### D2. v1 surfaces (corrected 2026-10-22)
+- **Customer AI agent.** End customers of the real-estate company.
+  - Retrieval in roughly 300 ms or less; first useful output in about 1–2 seconds.
+  - Strictest precision; shows customer-visible content only.
+- **Hand-off inbox.** Staff take over conversations from the AI.
+  - fastRag acts as an assistant: it retrieves from the conversation so far, not just a single question.
+  - Staff may see internal content.
+- **Internal knowledge.** Sales and advertising staff search internal documents.
+  - Speed matters less; broader recall is preferred.
+- The same documents and the same ingestion serve all three surfaces; they differ only in retrieval profile and access (D11).
 - The retrieval core stays reusable for automation pipelines later.
 
 ### D3. fastRag returns evidence; the agent writes the answer
@@ -77,11 +88,46 @@ _Last updated: 2026-10-22_
 - **Documents:** compared by content hash, so only changed files are re-processed.
 - **Future expansion:** a direct connection to the client's database or CRM. The client has mentioned this.
 
+### D9. Deployment: a private service next to the agent backend
+- fastRag runs as its own containers (API and ingestion workers) beside the agent backend, in the same cloud and private network.
+- It is never exposed to the internet.
+- **Interface:** REST between the backend and fastRag, carrying a service token, the tenant, the caller's scope and a trace ID. MCP can come later for outside platforms.
+- **Why separate:** ingestion load is heavy and spiky (OCR, embeddings) and must not slow down chat responses.
+- **Deployed together:** one Compose file or one Kubernetes namespace, so self-hosting stays cheap to add later.
+- **Storage:** Postgres (pgvector, full-text search, listing tables) plus object storage for raw files.
+
+### D10. Build a thin core; RAGFlow is the baseline to beat
+- Don't fork a full system. The parts that make fastRag valuable (Vietnamese handling, the typed listings path, evidence signals, `as_of` sync) would have to be built anyway.
+- **Borrow proven libraries:**
+  - parsing: docling, PaddleOCR
+  - embeddings and reranking: BGE-M3, bge-reranker-v2-m3
+  - vector search: pgvector
+  - model providers: LiteLLM
+  - API: FastAPI
+- **Write ourselves:** chunking, hybrid ranking with reciprocal rank fusion, and the evidence signals.
+- **Baseline:** run RAGFlow on the pilot's reference questions alongside fastRag. If it clearly wins on prose documents, reuse its document parser.
+- **Rejected:**
+  - LightRAG: built around the graph, which conflicts with D1
+  - R2R: maintenance status unclear
+  - Onyx: heavy, tuned for English
+  - Forking RAGFlow wholesale: too large a fork to maintain
+
+### D11. One body of documents, several audiences
+- Every document, passage and listing column carries a **visibility** label: `public` (safe for customers) or `internal`.
+- **The caller's scope decides what it can see:**
+  - the customer agent sees `public` only
+  - staff surfaces see `public` and `internal`
+- **Enforcement:** filters run inside the database query, never after retrieval. Tests must prove that the customer scope can never return internal content.
+- **Retrieval profiles are configuration, not separate code paths:**
+  - `customer`: strict, public only
+  - `handoff_copilot`: query built from the conversation, public and internal
+  - `internal_search`: broader recall, internal included
+
 ## Open questions
 
 - Does each project have one master sheet, or does each sales person keep their own copy? Separate copies would require deduplication and choosing which copy wins.
 - Where do the Excel files live: OneDrive/SharePoint, Google Drive, or local machines and email? This decides the second connector.
-- How is fastRag deployed: managed (we host it, shared by many tenants) or installed by each client? See Q7 in the discussion.
+- How is visibility assigned at ingest, for whole documents and for individual spreadsheet columns? See Q9 in the discussion.
 
 ## Next actions
 
