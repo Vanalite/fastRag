@@ -123,11 +123,23 @@ _Last updated: 2026-10-22_
   - `handoff_copilot`: query built from the conversation, public and internal
   - `internal_search`: broader recall, internal included
 
+### D12. Access groups are inherited from folders, with "internal" as the default
+- This is permission inheritance from the source, the same pattern large companies use for department folders.
+- **Folders map to access groups** (for example `public`, `staff`, later `managers`). Every passage and listing column inherits its folder's groups.
+- **Callers send their groups:**
+  - customer agent: `[public]`
+  - staff: `[public, staff]`
+- **Filtering:** keep only content whose groups overlap the caller's groups. The filter runs inside the database query.
+- **Spreadsheet columns:**
+  - The first time a sheet syncs, an admin marks which columns are public. The mapping is saved per sheet layout.
+  - New or unmapped columns default to internal.
+- **Safety net:** the ingestion scan flags phone numbers, "giá chốt", "hoa hồng" and similar patterns found in public content. An LLM classifier may suggest labels but never decides them.
+- **v1 mapping lives in fastRag's admin settings,** not copied from Google Drive sharing, because small businesses often share files as "anyone with the link".
+
 ## Open questions
 
 - Does each project have one master sheet, or does each sales person keep their own copy? Separate copies would require deduplication and choosing which copy wins.
 - Where do the Excel files live: OneDrive/SharePoint, Google Drive, or local machines and email? This decides the second connector.
-- How is visibility assigned at ingest, for whole documents and for individual spreadsheet columns? See Q9 in the discussion.
 
 ## Next actions
 
