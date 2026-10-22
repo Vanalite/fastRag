@@ -13,14 +13,20 @@ fastRag is meant to be a production-ready Retrieval-Augmented Generation (RAG) s
 1. **Customer-service agents** that answer customer questions from a company's own domain knowledge (docs, FAQs, policies, product data).
 2. **Data/automation pipelines** where retrieval is one step in a larger multi-step workflow.
 
-The retrieval approach is **knowledge-graph-based RAG** (in the GraphRAG / LightRAG family). Documents are ingested and turned into entities and relationships, then stored in a graph alongside vector embeddings of the chunks. Queries combine graph traversal with vector similarity, rather than relying on vector search alone.
+Retrieval is **hybrid-first**: keyword search (BM25) and vector search, followed by a reranker. A LightRAG-style knowledge-graph layer is optional, and it is kept only where the quality checks show it beats hybrid retrieval. fastRag returns evidence (passages, citations, evidence signals) and leaves answer generation, guardrails and hand-off to a human to the consuming agent.
+
+**`docs/design-log.md` is the source of truth for design decisions.** Read it before making architectural changes, and add to it when a decision is made or reversed. Key constraints recorded there:
+- The pilot is a Vietnamese real-estate business, so Vietnamese-language handling is a first-class concern.
+- Spreadsheet listings use a separate, typed path with filter queries.
+- Data is organised as tenant → collections.
+- Ingestion is connector-based sync (Google Sheets/Drive, Excel).
 
 ## Design constraints implied by the goal
 
 - **Language:** Python (implied by the `.gitignore`).
 - **Easy install and run** for non-expert operators. Prefer a single-command start, such as `docker compose up` or a `pip install` plus a CLI. Use sensible defaults and keep required configuration to a minimum.
 - **Agent-platform pluggability:** expose retrieval through stable, platform-neutral interfaces, for example an HTTP API and/or an MCP server or tool schema. Don't couple the code to one agent framework.
-- **Swappable backends:** keep the LLM provider, embedding model, vector store, and graph store behind interfaces, so an SMB can choose hosted or self-hosted options.
+- **Swappable backends:** keep the LLM provider, embedding model, reranker, and storage behind interfaces, so an SMB can choose hosted or self-hosted options.
 - **Multi-tenant awareness:** one deployment may serve several businesses or knowledge bases, so isolate data per tenant or collection.
 
 ## Commands
