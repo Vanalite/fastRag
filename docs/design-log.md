@@ -120,7 +120,7 @@ _Last updated: 2026-10-22_
 - **Enforcement:** filters run inside the database query, never after retrieval. Tests must prove that the customer scope can never return internal content.
 - **Retrieval profiles are configuration, not separate code paths:**
   - `customer`: strict, public only
-  - `handoff_copilot`: query built from the conversation, public and internal
+  - `handoff_copilot`: public and internal (caller builds the query, see D13)
   - `internal_search`: broader recall, internal included
 
 ### D12. Access groups are inherited from folders, with "internal" as the default
@@ -135,6 +135,17 @@ _Last updated: 2026-10-22_
   - New or unmapped columns default to internal.
 - **Safety net:** the ingestion scan flags phone numbers, "giá chốt", "hoa hồng" and similar patterns found in public content. An LLM classifier may suggest labels but never decides them.
 - **v1 mapping lives in fastRag's admin settings,** not copied from Google Drive sharing, because small businesses often share files as "anyone with the link".
+
+### D13. The caller interprets the question; fastRag standardizes values
+- **The agent's LLM, or the dashboard backend:**
+  - rewrites follow-up messages into questions that stand on their own
+  - extracts filters into `query_listings` arguments
+  - chooses which tool to call
+- **fastRag deterministically standardizes values:** prices ("3,5 tỷ", "850tr" → numbers in VND), districts and wards ("Q7", "Quận 7", "District 7" → one code), areas. It rejects filters it cannot interpret instead of guessing.
+- **No LLM on fastRag's query path.** LLMs are used only at ingestion: contextual chunking, cleaning up spreadsheet headers, optional entity extraction.
+- **This replaces part of D11:** the caller builds the query, and fastRag never reads conversations.
+- **Recommended, to confirm:** the agent keeps track of the listing IDs it has shown and passes them back, so a follow-up like "that unit" becomes an exact lookup by ID with a fresh `as_of`.
+- **Fallback:** if recall on short Vietnamese questions is poor, add query expansion in the agent, not in fastRag.
 
 ## Open questions
 
