@@ -146,11 +146,27 @@ _Last updated: 2026-10-22_
 - **This replaces part of D11:** the caller builds the query, and fastRag never reads conversations.
 - **Recommended, to confirm:** the agent keeps track of the listing IDs it has shown and passes them back, so a follow-up like "that unit" becomes an exact lookup by ID with a fresh `as_of`.
 - **Fallback:** if recall on short Vietnamese questions is poor, add query expansion in the agent, not in fastRag.
+- **Product definition:**
+  - fastRag is a retrieval engine for callers that already have an LLM and the conversation.
+  - It is not a search product for callers without an LLM; those are outside its target users.
+  - Managed search products such as Vertex AI Search and Bedrock Knowledge Bases put an LLM inside because their callers may lack one. That reasoning does not apply here.
+  - Multi-hop questions are handled by the agent calling the tools repeatedly (agentic RAG), not by fastRag.
+
+### D14. Models: open embedding model, hosted reranker
+- **Embeddings: BGE-M3** (open weights).
+  - Changing the embedding model later means re-indexing every document, so we avoid vendor lock-in here.
+  - Run it on CPU workers at pilot volume. If CPU capacity becomes a problem, use a hosted inference provider serving the same model.
+- **Reranker: a hosted multilingual reranker,** to meet the speed target without a GPU. It can be swapped at any time with no re-indexing.
+- **Move the reranker to our own GPU** only when traffic or cost justifies it.
+- **Before committing:** benchmark two or three embedding and reranker combinations against the pilot's reference questions (D4).
+- Both models sit behind interfaces (see CLAUDE.md, "Swappable backends").
 
 ## Open questions
 
 - Does each project have one master sheet, or does each sales person keep their own copy? Separate copies would require deduplication and choosing which copy wins.
 - Where do the Excel files live: OneDrive/SharePoint, Google Drive, or local machines and email? This decides the second connector.
+
+- Expected pilot traffic: tens or thousands of customer conversations a day? This decides whether CPU embedding and a hosted reranker remain viable.
 
 ## Next actions
 
