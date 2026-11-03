@@ -52,8 +52,12 @@ class ClaudeGenerator:
                 # If a safety classifier declines, the API retries on a suitable fallback model.
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
-                # The system prompt never changes, so it is cached; the per-question
-                # documents come after it and don't break the cached prefix.
+                # The breakpoint sits after the stable prefix (the system prompt), so the
+                # per-question documents never invalidate it. Note: the API only caches
+                # prefixes above a model-specific minimum (512-4096 tokens). This system
+                # prompt is far shorter, so today the marker is a no-op and
+                # cache_read_input_tokens stays 0. It starts paying off once the stable
+                # prefix grows (longer instructions, few-shot examples, tool definitions).
                 system=[
                     {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
                 ],
