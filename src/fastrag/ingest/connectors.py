@@ -32,8 +32,13 @@ class FilesystemConnector:
         if not self.root.exists():
             raise FileNotFoundError(self.root)
         base = self.root if self.root.is_dir() else self.root.parent
+        real_base = base.resolve()
         files = [self.root] if self.root.is_file() else sorted(self.root.rglob("*"))
         for path in files:
+            # Symlinked files are skipped below; this also stops symlinked *folders*
+            # from pulling in files from elsewhere on the machine.
+            if not path.resolve().is_relative_to(real_base):
+                continue
             media_type = MEDIA_TYPES.get(path.suffix.lower())
             if media_type is None or not path.is_file() or path.is_symlink():
                 continue

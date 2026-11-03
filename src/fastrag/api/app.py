@@ -7,15 +7,23 @@ The HTTP layer stays thin: authenticate, translate JSON <-> domain objects, map 
 to status codes. Every decision about access lives in ``RAGService``.
 """
 
+import contextlib
+import json
 import logging
 import re
+import threading
+import time
 import uuid
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import anyio
 from fastapi import Depends, FastAPI, Query, Request, Security
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -23,6 +31,8 @@ from fastrag import __version__
 from fastrag.api.schemas import (
     AskResponse,
     DocumentOut,
+    IngestJobOut,
+    IngestJobRequest,
     IngestRequest,
     IngestResponse,
     PrincipalOut,
@@ -34,6 +44,8 @@ from fastrag.config import Settings
 from fastrag.domain import DocumentIn, Principal
 from fastrag.errors import (
     AuthenticationError,
+    ConcurrentModification,
+    ConfigurationError,
     FastRagError,
     GenerationError,
     InvalidInput,
@@ -42,8 +54,15 @@ from fastrag.errors import (
     RateLimited,
 )
 from fastrag.observability import configure_logging, request_id_var
-from fastrag.security.auth import ApiKeyStore, Authenticator, JwtVerifier
-from fastrag.service import RAGService
+from fastrag.ratelimit import Limiter, RateLimiter, RedisRateLimiter
+from fastrag.security.auth import (
+    ApiKeyStore,
+    Authenticator,
+    ClaimMapping,
+    JwtVerifier,
+    OidcVerifier,
+)
+from fastrag.service import AskEvent, RAGService
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +74,7 @@ _STATUS = {
     AuthenticationError: 401,
     PermissionDenied: 403,
     NotFound: 404,
+    ConcurrentModification: 409,
     InvalidInput: 422,
     RateLimited: 429,
     GenerationError: 502,
@@ -68,7 +88,118 @@ def _error(status: int, kind: str, message: str, **extra) -> JSONResponse:
     return JSONResponse(body, status_code=status)
 
 
-def create_app(service: RAGService, authenticator: Authenticator) -> FastAPI:
+class _ThrottleAudit:
+    """Turns a flood of throttled logins into one audit entry per client per interval.
+
+    Each throttled attempt is counted; the first one, and then at most one per
+    ``interval`` seconds, is written to the audit log with the number of attempts seen
+    since the last entry. Attacks stay visible without the log becoming the target.
+    """
+
+    def __init__(self, interval: float = 60.0, max_clients: int = 10_000, clock=time.monotonic):
+        self.interval = interval
+        self.max_clients = max_clients
+        self._clock = clock
+        self._state: OrderedDict[str, tuple[float, int]] = OrderedDict()  # last audit, count
+        self._lock = threading.Lock()
+
+    def note(self, client: str) -> int | None:
+        """Count one throttled attempt; return the count to audit now, or None."""
+        now = self._clock()
+        with self._lock:
+            last, count = self._state.get(client, (float("-inf"), 0))
+            count += 1
+            if now - last >= self.interval:
+                self._state[client] = (now, 0)
+                result: int | None = count
+            else:
+                self._state[client] = (last, count)
+                result = None
+            self._state.move_to_end(client)
+            while len(self._state) > self.max_clients:
+                self._state.popitem(last=False)
+            return result
+
+
+def _document_in(body: IngestRequest) -> DocumentIn:
+    return DocumentIn(
+        source_id=body.source_id,
+        text=body.text,
+        acl=body.acl_tokens(),
+        title=body.title,
+        media_type=body.media_type,
+        metadata=body.metadata,
+        editors=frozenset(body.editors),
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _stream_error(exc: Exception, request_id: str | None) -> str:
+    if isinstance(exc, FastRagError) and not isinstance(exc, ConfigurationError):
+        kind, message = type(exc).__name__, str(exc)
+        if isinstance(exc, GenerationError):
+            message = "the answer generator failed; try again later"
+    else:
+        log.exception("unhandled error while streaming")
+        kind, message = "InternalError", "internal server error"
+    return _sse("error", {"error": {"type": kind, "message": message}, "request_id": request_id})
+
+
+async def _event_stream(
+    first: AskEvent, events: Iterator[AskEvent], request_id: str | None
+) -> AsyncIterator[str]:
+    """Server-sent events for one answer, with a well-defined end in every case.
+
+    The service generator is advanced in a worker thread (it does blocking I/O), with the
+    request id restored for logs and the audit, since the request middleware has already
+    returned. Three endings:
+
+    * The answer is ready: the generator is run to completion *before* the answer is
+      sent, so the audit records success even if the client leaves right after.
+    * A failure mid-stream: reported in-band as an ``error`` event.
+    * The client disconnects: this coroutine is cancelled and ``finally`` closes the
+      generator at once, so the audit records ``cancelled`` with the right request id,
+      instead of whenever the garbage collector gets to it.
+    """
+
+    def in_context(fn, *args):
+        token = request_id_var.set(request_id)
+        try:
+            return fn(*args)
+        finally:
+            request_id_var.reset(token)
+
+    def drain() -> None:
+        for _ in events:
+            pass
+
+    event: AskEvent | None = first
+    try:
+        while event is not None:
+            if event.type == "answer":
+                assert event.answer is not None
+                await run_in_threadpool(in_context, drain)
+                yield _sse("answer", AskResponse.of(event.answer).model_dump())
+                return
+            yield _sse("delta", {"text": event.text})
+            event = await run_in_threadpool(in_context, next, events, None)
+    except Exception as exc:  # the stream has started: report in-band, then stop
+        yield in_context(_stream_error, exc, request_id)
+    finally:
+        # Shielded: a cancelled task would otherwise abort this cleanup immediately.
+        with anyio.CancelScope(shield=True):
+            await run_in_threadpool(in_context, events.close)
+
+
+def create_app(
+    service: RAGService,
+    authenticator: Authenticator,
+    *,
+    auth_failure_limiter: Limiter | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -81,6 +212,19 @@ def create_app(service: RAGService, authenticator: Authenticator) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.service = service
+    settings = service.settings
+    if auth_failure_limiter is not None:
+        auth_failures: Limiter = auth_failure_limiter
+    elif service.redis is not None:  # one budget per address across all replicas
+        auth_failures = RedisRateLimiter(
+            service.redis,
+            settings.auth_failures_per_minute,
+            settings.auth_failure_burst,
+            prefix="fastrag:rl:auth:",
+        )
+    else:
+        auth_failures = RateLimiter(settings.auth_failures_per_minute, settings.auth_failure_burst)
+    throttle_audit = _ThrottleAudit()
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
@@ -145,11 +289,36 @@ def create_app(service: RAGService, authenticator: Authenticator) -> FastAPI:
         bearer: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)] = None,
     ) -> Principal:
         authorization = f"Bearer {bearer.credentials}" if bearer else None
+        # Brute-force protection, per client address. Failed logins spend tokens; once an
+        # address has none left, it gets 429 *before* its credentials are evaluated, so
+        # it can't keep guessing. Successful logins never spend tokens. The address is the
+        # direct peer: behind a proxy, run uvicorn with --forwarded-allow-ips so it is the
+        # real client, or every user behind the proxy shares one budget.
+        client = request.client.host if request.client else "unknown"
+        try:
+            auth_failures.ensure_available(client)
+        except RateLimited:
+            service.metrics.requests.inc(
+                {"action": "authenticate", "outcome": "throttled", "tenant": "-"}
+            )
+            attempts = throttle_audit.note(client)
+            if attempts is not None:
+                service.audit.record(
+                    "authenticate", "throttled", None, client=client, attempts=attempts
+                )
+            raise
         try:
             return authenticator.authenticate(authorization, api_key)
         except AuthenticationError as exc:
+            with contextlib.suppress(RateLimited):  # a concurrent failure took the last token
+                auth_failures.check(client)
             service.audit.record(
-                "authenticate", "unauthenticated", None, path=request.url.path, reason=str(exc)
+                "authenticate",
+                "unauthenticated",
+                None,
+                path=request.url.path,
+                client=client,
+                reason=str(exc),
             )
             service.metrics.requests.inc(
                 {"action": "authenticate", "outcome": "unauthenticated", "tenant": "-"}
@@ -188,22 +357,32 @@ def create_app(service: RAGService, authenticator: Authenticator) -> FastAPI:
 
     @app.post("/v1/documents", tags=["documents"], status_code=201)
     def ingest(body: IngestRequest, principal: Caller) -> IngestResponse:
-        result = service.ingest(
-            principal,
-            DocumentIn(
-                source_id=body.source_id,
-                text=body.text,
-                acl=body.acl_tokens(),
-                title=body.title,
-                media_type=body.media_type,
-                metadata=body.metadata,
-            ),
-        )
+        result = service.ingest(principal, _document_in(body))
         return IngestResponse(**vars(result))
 
+    @app.post("/v1/ingest-jobs", tags=["documents"], status_code=202)
+    def submit_ingest_job(
+        body: IngestJobRequest, principal: Caller, response: Response
+    ) -> IngestJobOut:
+        """Queue up to 500 documents for background ingestion. Poll the returned job."""
+        job = service.submit_ingest_job(principal, [_document_in(d) for d in body.documents])
+        response.headers["Location"] = f"/v1/ingest-jobs/{job.id}"
+        return IngestJobOut.of(job)
+
+    @app.get("/v1/ingest-jobs/{job_id}", tags=["documents"])
+    def get_ingest_job(job_id: str, principal: Caller) -> IngestJobOut:
+        return IngestJobOut.of(service.ingest_job(principal, job_id))
+
     @app.get("/v1/documents", tags=["documents"])
-    def list_documents(principal: Caller) -> list[DocumentOut]:
-        return [DocumentOut.of(d) for d in service.list_documents(principal)]
+    def list_documents(
+        principal: Caller,
+        response: Response,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> list[DocumentOut]:
+        docs = service.list_documents(principal)
+        response.headers["X-Total-Count"] = str(len(docs))
+        return [DocumentOut.of(d) for d in docs[offset : offset + limit]]
 
     @app.delete("/v1/documents/{doc_id}", tags=["documents"], status_code=204)
     def delete_document(doc_id: str, principal: Caller) -> Response:
@@ -221,6 +400,26 @@ def create_app(service: RAGService, authenticator: Authenticator) -> FastAPI:
     def ask(body: QueryRequest, principal: Caller) -> AskResponse:
         return AskResponse.of(service.ask(principal, body.question, body.k))
 
+    @app.post(
+        "/v1/ask/stream",
+        tags=["query"],
+        response_class=StreamingResponse,
+        responses={200: {"content": {"text/event-stream": {}}}},
+    )
+    def ask_stream(body: QueryRequest, principal: Caller) -> StreamingResponse:
+        """Server-sent events: `delta` events with text as it is generated, then one
+        `answer` event (same shape as `/v1/ask`) carrying the validated answer and
+        citations - keep that one. Failures after streaming starts arrive as `error`."""
+        events = service.ask_stream(principal, body.question, body.k)
+        # Run up to the first event now: authorization, rate limits, validation and
+        # retrieval errors then become ordinary HTTP errors instead of a 200 stream.
+        first = next(events)
+        return StreamingResponse(
+            _event_stream(first, events, request_id_var.get()),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},  # don't let proxies buffer the stream
+        )
+
     @app.get("/v1/audit", tags=["governance"])
     def audit(
         principal: Caller, limit: Annotated[int, Query(ge=1, le=1000)] = 100
@@ -234,14 +433,34 @@ def create_app_from_settings(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings.log_level, settings.log_json)
     service = RAGService.from_settings(settings)
+    return create_app(service, build_authenticator(settings))
+
+
+def build_authenticator(settings: Settings) -> Authenticator:
+    claims = ClaimMapping(
+        tenant=settings.token_tenant_claim,
+        groups=settings.token_groups_claim,
+        roles=settings.token_roles_claim,
+    )
     jwt_verifier = (
         JwtVerifier(
             settings.jwt_secret.get_secret_value(),
             issuer=settings.jwt_issuer,
             audience=settings.jwt_audience,
+            claims=claims,
         )
         if settings.jwt_secret
         else None
     )
+    oidc_verifier = (
+        OidcVerifier(
+            settings.oidc_jwks_url,
+            issuer=settings.jwt_issuer or "",
+            audience=settings.jwt_audience or "",
+            claims=claims,
+        )
+        if settings.oidc_jwks_url
+        else None
+    )
     api_keys = ApiKeyStore(settings.api_keys_file) if settings.api_keys_file else None
-    return create_app(service, Authenticator(api_keys=api_keys, jwt_verifier=jwt_verifier))
+    return Authenticator(api_keys=api_keys, jwt_verifier=jwt_verifier, oidc_verifier=oidc_verifier)

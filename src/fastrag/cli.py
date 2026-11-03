@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from fastrag.config import Settings
 from fastrag.domain import EVERYONE, Principal, Role
-from fastrag.errors import ConfigurationError, FastRagError
+from fastrag.errors import ConfigurationError, FastRagError, InvalidInput
 
 
 def _principal_args(p: argparse.ArgumentParser, user_required: bool = True) -> None:
@@ -60,6 +61,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("documents", help="list documents visible to a principal")
     _principal_args(p, user_required=False)
 
+    p = sub.add_parser(
+        "sync",
+        help="sync a folder into a tenant, permissions from a manifest (adds, updates, prunes)",
+    )
+    p.add_argument("root", type=Path)
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--manifest", type=Path, required=True, help="JSON ACL rules (see docs)")
+    p.add_argument("--name", help="connector name (default: the folder name)")
+    p.add_argument("--no-prune", action="store_true", help="keep documents gone from the source")
+    p.add_argument(
+        "--force-prune",
+        action="store_true",
+        help="allow deleting most of the connector's documents",
+    )
+    p.add_argument(
+        "--adopt", action="store_true", help="take over existing documents it didn't create"
+    )
+
     p = sub.add_parser("delete", help="delete a document by id")
     p.add_argument("doc_id")
     p.add_argument("--tenant", required=True)
@@ -74,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p = keys.add_parser("create", help="create an API key (printed once)")
     _principal_args(p)
+    p.add_argument("--ttl-days", type=float, help="expire the key after this many days")
+    p = keys.add_parser("list", help="list API keys (ids and owners, never the keys)")
+    p.add_argument("--tenant", help="only this tenant")
+    p = keys.add_parser("revoke", help="revoke an API key by id (takes effect immediately)")
+    p.add_argument("key_id")
 
     p = sub.add_parser("token", help="mint a demo JWT (needs FASTRAG_JWT_SECRET)")
     _principal_args(p)
@@ -83,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="audit_command", required=True
     )
     audit.add_parser("verify", help="verify the audit log hash chain")
+
+    db = sub.add_parser("db", help="database administration").add_subparsers(
+        dest="db_command", required=True
+    )
+    db.add_parser("migrate", help="apply pending schema migrations, then exit")
 
     sub.add_parser(
         "eval", help="run the retrieval evaluation gate (see `fastrag eval --help`)", add_help=False
@@ -116,27 +145,65 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         return 0
 
     if args.command == "keys":
-        from fastrag.security.auth import ApiKeyStore
+        from fastrag.security.auth import ApiKeyStore, hash_api_key, key_id
 
         if settings.api_keys_file is None:
             raise ConfigurationError("FASTRAG_API_KEYS_FILE is not set")
-        key = ApiKeyStore(settings.api_keys_file).create(_principal(args))
-        print(key)
-        print(
-            f"Stored a hash of this key in {settings.api_keys_file}. It won't be shown again.",
-            file=sys.stderr,
-        )
+        store = ApiKeyStore(settings.api_keys_file)
+        if args.keys_command == "create":
+            ttl = args.ttl_days * 86400 if args.ttl_days is not None else None
+            try:
+                key = store.create(_principal(args), ttl_seconds=ttl)
+            except ValueError as exc:
+                raise InvalidInput(str(exc)) from exc
+            print(key)
+            print(
+                f"Stored a hash of this key (id {key_id(hash_api_key(key))}) in "
+                f"{settings.api_keys_file}. It won't be shown again.",
+                file=sys.stderr,
+            )
+        elif args.keys_command == "list":
+            now = time.time()
+            for r in store.records():
+                if args.tenant and r.principal.tenant_id != args.tenant:
+                    continue
+                state = "revoked" if r.revoked_at else "expired" if not r.active(now) else "active"
+                roles = ",".join(sorted(role.value for role in r.principal.roles))
+                groups = ",".join(sorted(r.principal.groups)) or "-"
+                print(
+                    f"{r.key_id}  {state:8} {r.principal.tenant_id}/{r.principal.user_id}"
+                    f"  roles={roles} groups={groups}"
+                )
+        else:
+            try:
+                revoked = store.revoke(args.key_id)
+            except ValueError as exc:
+                raise InvalidInput(str(exc)) from exc
+            print(f"revoked {revoked.key_id} ({revoked.principal.user_id})")
         return 0
 
     if args.command == "token":
-        from fastrag.security.auth import JwtVerifier
+        from fastrag.security.auth import ClaimMapping, JwtVerifier
 
         if settings.jwt_secret is None:
             raise ConfigurationError("FASTRAG_JWT_SECRET is not set")
         verifier = JwtVerifier(
-            settings.jwt_secret.get_secret_value(), settings.jwt_issuer, settings.jwt_audience
+            settings.jwt_secret.get_secret_value(),
+            settings.jwt_issuer,
+            settings.jwt_audience,
+            claims=ClaimMapping(
+                tenant=settings.token_tenant_claim,
+                groups=settings.token_groups_claim,
+                roles=settings.token_roles_claim,
+            ),
         )
         print(verifier.issue(_principal(args), ttl_seconds=args.ttl))
+        return 0
+
+    if args.command == "db":
+        from fastrag.service import migrate_database
+
+        print(migrate_database(settings))
         return 0
 
     if args.command == "audit":
@@ -150,9 +217,14 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
         print(f"{len(entries)} entries; chain {'OK' if ok else 'BROKEN'}")
         return 0 if ok else 1
 
+    # The CLI acts as a local operator on files it can already read, so the HTTP rate
+    # limits (meant for remote callers) don't apply: a bulk ingest must not stop at the
+    # burst size.
+    from fastrag.ratelimit import RateLimiter
     from fastrag.service import RAGService
 
-    service = RAGService.from_settings(settings)
+    unlimited = RateLimiter(0, 0)
+    service = RAGService.from_settings(settings, limiter=unlimited, user_limiter=unlimited)
 
     if args.command == "ingest":
         from fastrag.ingest import FilesystemConnector
@@ -183,6 +255,29 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
             print(f"{result.status:9} {d.source_id:32} acl={sorted(d.acl)}")
         print(f"tenant: {dataset.tenant_id}")
         return 0
+
+    if args.command == "sync":
+        from fastrag.ingest import ManifestConnector, SyncService
+
+        operator = Principal(args.tenant, "cli-operator", roles=frozenset({Role.ADMIN}))
+        connector = ManifestConnector.from_manifest(
+            args.name or args.root.resolve().name, args.root, args.manifest
+        )
+        report = SyncService(service).sync(
+            operator,
+            connector,
+            prune=not args.no_prune,
+            force_prune=args.force_prune,
+            adopt_existing=args.adopt,
+        )
+        for source_id, error in report.failed:
+            print(f"failed   {source_id}: {error}", file=sys.stderr)
+        for source_id in report.skipped:
+            print(f"skipped  {source_id} (no ACL rule matches)", file=sys.stderr)
+        for source_id in report.adopt_refused:
+            print(f"skipped  {source_id} (exists, not created by this connector)", file=sys.stderr)
+        print(json.dumps(report.summary()))
+        return 1 if report.failed else 0
 
     if args.command == "delete":
         operator = Principal(args.tenant, "cli-operator", roles=frozenset({Role.ADMIN}))

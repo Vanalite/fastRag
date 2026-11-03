@@ -6,16 +6,16 @@ Most RAG demos stop at "embed, search, prompt". The hard parts in an enterprise 
 
 | Concern | What this repo does | Where |
 | --- | --- | --- |
-| Identity | API keys (stored hashed) and JWT bearer tokens resolve to a `Principal` (tenant, user, groups, roles) | `security/auth.py` |
+| Identity | API keys (stored hashed, with expiry and instant revocation) and bearer tokens from your identity provider (OIDC, verified against its published keys) resolve to a `Principal` (tenant, user, groups, roles) | `security/auth.py` |
 | Permissions | Roles (reader, ingester, admin) decide what a caller may *do* | `security/rbac.py` |
-| Document access | Every chunk carries its tenant and ACL. Every index search *requires* an access filter and applies it before ranking | `security/acl.py`, `storage/` |
+| Document access | Every chunk carries its tenant and ACL. Every index search *requires* an access filter and applies it before ranking. Separate `editors` decide who may change a document: reading never implies writing | `security/acl.py`, `storage/`, `service.py` |
 | Consistency | SQLite is the single source of truth; vector and keyword indexes are rebuilt from it. Re-ingest creates a new version; delete removes the document from every index and the cache | `storage/`, `ingest/service.py` |
-| Retrieval quality | Hybrid search: BM25 + dense vectors, fused with reciprocal rank fusion | `retrieval/` |
+| Retrieval quality | Hybrid search: BM25 + dense vectors, fused with reciprocal rank fusion, with an optional cross-encoder reranker | `retrieval/` |
 | Grounding | Abstains without calling the LLM when evidence is weak; validates that citations point at documents that were shown | `service.py`, `generation/citations.py` |
 | Prompt injection | Documents are escaped, delimited and labeled untrusted; suspicious ones are flagged (optionally dropped) and audited | `generation/prompt.py` |
-| Privacy | PII (emails, phone numbers, SSNs, card numbers) is redacted at ingest, before anything is embedded or sent to an LLM | `ingest/redact.py` |
+| Privacy | PII (emails, phone numbers, SSNs, card numbers) is redacted at ingest, before anything is embedded, and in questions before they are sent to the LLM | `ingest/redact.py`, `service.py` |
 | Governance | Append-only, hash-chained audit log of who asked what and which documents they were shown (ids and hashes only, never content) | `observability/audit.py` |
-| Operations | Per-tenant rate limits, an access-scoped answer cache, Prometheus metrics, JSON logs with request ids, health and readiness probes | `ratelimit.py`, `cache.py`, `observability/` |
+| Operations | Per-tenant and per-user rate limits and an access-scoped answer cache, in process or shared across replicas through Redis; Prometheus metrics, OpenTelemetry spans, JSON logs with request ids, health and readiness probes | `ratelimit.py`, `cache.py`, `observability/` |
 | Evaluation | A golden dataset and a retrieval-quality gate in CI (recall, MRR, nDCG, abstention accuracy, zero ACL leaks) | `eval/`, `src/fastrag/eval/` |
 
 Everything runs offline with zero infrastructure: a hashing embedder, an extractive answer mode and in-process stores. Answers from Claude, semantic embeddings and external stores plug in behind interfaces.
@@ -75,15 +75,27 @@ curl -s localhost:8000/v1/ask -H "X-API-Key: <key>" -H "content-type: applicatio
 | Method | Path | Who | Purpose |
 | --- | --- | --- | --- |
 | POST | `/v1/ask` | reader+ | Grounded answer with citations |
+| POST | `/v1/ingest-jobs` | editor or admin | Queue up to 500 documents for background ingestion (202 + `Location`) |
+| GET | `/v1/ingest-jobs/{id}` | submitter or admin | Job progress and per-document results |
+| POST | `/v1/ask/stream` | reader+ | The same, streamed as server-sent events: `delta` events, then the validated `answer` |
 | POST | `/v1/search` | reader+ | Ranked chunks with dense and keyword scores |
-| GET | `/v1/documents` | reader+ | Documents visible to the caller |
-| POST | `/v1/documents` | ingester+ | Create or replace a document (with its ACL) |
-| DELETE | `/v1/documents/{doc_id}` | ingester+ | Delete a document everywhere |
+| GET | `/v1/documents` | reader+ | Documents visible to the caller (`limit`/`offset`, total in `X-Total-Count`) |
+| POST | `/v1/documents` | editor or admin | Create or replace a document (with its read `acl` and `editors`) |
+| DELETE | `/v1/documents/{doc_id}` | editor or admin | Delete a document everywhere |
 | GET | `/v1/audit` | admin | The tenant's audit trail |
 | GET | `/v1/me` | any | Who the credentials resolve to |
 | GET | `/healthz`, `/readyz`, `/metrics` | none | Probes and Prometheus metrics |
 
-Interactive API docs are at `/docs`. JWTs work too: set `FASTRAG_JWT_SECRET` and send `Authorization: Bearer <token>` (`fastrag token ...` mints one for testing).
+Interactive API docs are at `/docs`.
+
+**Keys and tokens.**
+- `fastrag keys list` shows key ids and owners, never the keys themselves.
+- `fastrag keys revoke <key-id>` takes effect immediately, even in a running server.
+- `--ttl-days` on `keys create` sets an expiry.
+- For user sign-in, point fastRag at your identity provider: set `FASTRAG_OIDC_JWKS_URL`, `FASTRAG_JWT_ISSUER` and `FASTRAG_JWT_AUDIENCE`, and send `Authorization: Bearer <token>`. If your provider uses different claim names, map them with `FASTRAG_TOKEN_TENANT_CLAIM`, `FASTRAG_TOKEN_GROUPS_CLAIM` and `FASTRAG_TOKEN_ROLES_CLAIM`.
+- For local testing, `FASTRAG_JWT_SECRET` and `fastrag token ...` mint shared-secret tokens.
+
+**Production mode.** `FASTRAG_ENVIRONMENT=production` refuses to start with an unsafe configuration: an in-memory database, no audit log, no authentication, tokens without issuer and audience checks, or rate limits off.
 
 ### Docker
 
@@ -109,6 +121,8 @@ uv run fastrag eval
 
 ## Learn more
 
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release, including upgrade notes.
+
 Start with [docs/README.md](docs/README.md) for a reading order. Key documents:
 
 - [Architecture](docs/architecture.md): components, request lifecycle and data model
@@ -118,7 +132,7 @@ Start with [docs/README.md](docs/README.md) for a reading order. Key documents:
 
 ## What is deliberately not here
 
-These are documented extension points, not implemented: OIDC/JWKS token verification, Postgres/pgvector storage, a cross-encoder reranker, an asynchronous ingestion queue, streaming answers, distributed rate limiting and OpenTelemetry tracing. [docs/architecture.md](docs/architecture.md) explains where each would plug in.
+Still extension points, not implemented: durable job queues across restarts (jobs are in-process), connectors for specific systems such as SharePoint, Confluence or Drive (the sync framework and a manifest-based connector ship; see `docs/operations.md`), and NER-based PII detection. [docs/architecture.md](docs/architecture.md) explains where each would plug in.
 
 ## Development
 

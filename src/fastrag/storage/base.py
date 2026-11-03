@@ -16,6 +16,9 @@ import numpy as np
 from fastrag.domain import Chunk, DocumentRecord
 from fastrag.security.acl import AccessFilter
 
+# Sentinel for "don't check the version" (None already means "must not exist").
+UNCHECKED: object = object()
+
 
 class DocumentStore(Protocol):
     def check_embedder(self, name: str) -> None:
@@ -26,12 +29,25 @@ class DocumentStore(Protocol):
     def list_documents(self, tenant_id: str) -> list[DocumentRecord]: ...
 
     def replace_document(
-        self, record: DocumentRecord, chunks: list[Chunk], embeddings: np.ndarray
+        self,
+        record: DocumentRecord,
+        chunks: list[Chunk],
+        embeddings: np.ndarray,
+        expected_version: int | None | object = ...,
     ) -> list[str]:
-        """Atomically write a new version; return the ids of the chunks it replaced."""
+        """Atomically write a new version; return the ids of the chunks it replaced.
 
-    def delete_document(self, tenant_id: str, doc_id: str) -> list[str] | None:
-        """Remove a document and its chunks; return removed chunk ids, or None if absent."""
+        With ``expected_version`` (``None`` meaning "must not exist yet"), raise
+        ``ConcurrentModification`` instead if the stored version differs.
+        """
+
+    def delete_document(
+        self, tenant_id: str, doc_id: str, expected_version: int | None | object = ...
+    ) -> list[str] | None:
+        """Remove a document and its chunks; return removed chunk ids, or None if absent.
+
+        ``expected_version`` works as for ``replace_document``.
+        """
 
     def bump_generation(self, tenant_id: str) -> None:
         """Mark the tenant's corpus as changed. Call after the indexes reflect the change."""

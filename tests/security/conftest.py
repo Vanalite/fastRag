@@ -71,7 +71,9 @@ def generator() -> ScriptedGenerator:
 @pytest.fixture
 def make_service(generator):
     def _make(**overrides) -> RAGService:
-        overrides.setdefault("rate_limit_per_minute", 0)  # disabled unless a test opts in
+        # Rate limits are disabled unless a test opts in.
+        overrides.setdefault("rate_limit_per_minute", 0)
+        overrides.setdefault("user_rate_limit_per_minute", 0)
         return RAGService.from_settings(Settings.for_testing(**overrides), generator=generator)
 
     return _make

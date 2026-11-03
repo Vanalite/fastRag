@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 from fastrag.domain import ScoredChunk
 from fastrag.generation.base import Generation
 
@@ -18,3 +20,8 @@ class ExtractiveGenerator:
         for i, source in enumerate(shown, start=1):
             lines.append(f"\n[{i}] {source.chunk.text}")
         return Generation(text="\n".join(lines), citations=list(range(1, len(shown) + 1)))
+
+    def stream(self, question: str, sources: list[ScoredChunk]) -> Iterator[str | Generation]:
+        generation = self.generate(question, sources)
+        yield from generation.text.splitlines(keepends=True)
+        yield generation

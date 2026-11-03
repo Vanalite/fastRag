@@ -13,25 +13,27 @@ A reference implementation has to run on a laptop with no accounts, no API keys 
 
 | Concern | Default | Real option |
 |---|---|---|
-| Document store | SQLite file, `.fastrag/fastrag.db` (`config.py:16`) | Postgres (not implemented) |
-| Embedder | `hashing` (`config.py:17`, `embeddings/hashing.py`): feature hashing over words and word pairs, deterministic, no model | `st:<model>` (`embeddings/sentence_transformers.py`), optional extra |
-| Vector and keyword indexes | In-process NumPy and BM25 (`storage/vector.py`, `storage/bm25.py`) | pgvector, OpenSearch (not implemented) |
-| Generator | `extractive` (`config.py:33`, `generation/extractive.py`): quotes the top passages with citations. No LLM call. | `claude` (`generation/claude.py`), optional extra |
-| Cache, rate limiter | In-process (`cache.py`, `ratelimit.py`) | Redis (not implemented) |
-| Audit | JSONL file (`config.py:46`) | WORM storage or a SIEM through a new `AuditSink` |
-| API keys | JSON file with hashes (`config.py:40`) | Identity provider with OIDC or JWKS (not implemented) |
+| Document store | SQLite file, `.fastrag/fastrag.db` (`Settings.database_path`) | Postgres with pgvector, `FASTRAG_POSTGRES_DSN` (`storage/postgres.py`, ADR 0007) |
+| Embedder | `hashing` (`embeddings/hashing.py`): feature hashing over words and word pairs, deterministic, no model | `st:<model>` (`embeddings/sentence_transformers.py`), optional extra |
+| Vector and keyword indexes | In-process NumPy and BM25 (`storage/vector.py`, `storage/bm25.py`) | pgvector and Postgres full-text search over the store's tables (`storage/postgres.py`). OpenSearch is not implemented. |
+| Generator | `extractive` (`generation/extractive.py`): quotes the top passages with citations. No LLM call. | `claude` (`generation/claude.py`), optional extra |
+| Cache, rate limiters | In-process (`cache.py`, `ratelimit.py`) | Redis, `FASTRAG_REDIS_URL` (`RedisAnswerCache`, `RedisRateLimiter`) |
+| Audit | JSONL file (`Settings.audit_log_path`) | WORM storage or a SIEM through a new `AuditSink` |
+| API keys | JSON file with hashes, with expiry and revocation (`security/auth.py`) | Identity provider over OIDC, implemented as `OidcVerifier` and enabled by `FASTRAG_OIDC_JWKS_URL` |
 
 With these defaults, `fastrag ingest`, `fastrag ask` and `fastrag serve` work offline. `pip install 'fastrag[claude]'` or `[st]` adds the optional backends.
 
-**Adapters sit behind small protocols.** `Embedder` (`embeddings/base.py`), `DocumentStore`, `VectorIndex`, `KeywordIndex` (`storage/base.py`), `Generator` (`generation/base.py`) and `AuditSink` (`observability/audit.py`) are `typing.Protocol` classes. `RAGService` takes them as constructor arguments (`service.py:65-77`), so a test or an adapter can swap one without touching the rest. The `storage/base.py` docstring is the contract for a new store.
+**Adapters sit behind small protocols.** `Embedder` (`embeddings/base.py`), `DocumentStore`, `VectorIndex`, `KeywordIndex` (`storage/base.py`), `Generator` (`generation/base.py`), `Reranker` (`retrieval/rerank.py`) and `AuditSink` (`observability/audit.py`) are `typing.Protocol` classes. `RAGService` takes them as constructor arguments, so a test or an adapter can swap one without touching the rest. The `storage/base.py` docstring is the contract for a new store.
 
-**Evaluation is a regression gate, not a quality claim.** `fastrag eval` (`src/fastrag/eval/__init__.py`) ingests the golden dataset in `eval/golden/` into a fresh in-memory service. It asks each question as its own principal and reports:
+**Evaluation is a regression gate, not a quality claim.** `fastrag eval` (`src/fastrag/eval/`) ingests the golden dataset in `eval/golden/` into a fresh in-memory service. It asks each question as its own principal and reports:
 
 - recall@k, MRR and nDCG@k over answerable questions, document-level and binary;
 - abstention accuracy, for out-of-scope questions and for questions about documents the asker may not read;
 - ACL leaks, which must always be zero. The dataset manifest (`eval/golden/corpus.json`) gives each file's ACL.
 
-Exit codes are 0 for pass, 1 for a gate failure and 2 for an error. The thresholds are set a little below the scores measured with the default hashing embedder. The module's own docstring says they are not a quality claim, and that they should be raised as retrieval improves and never lowered to get CI green. The coordinator's most recent measurement with the hashing embedder was recall@4 1.0, MRR 0.98 and nDCG@4 0.985 on the ten-document, 32-question set.
+Exit codes are 0 for pass, 1 for a gate failure and 2 for an error. The thresholds are set a little below the scores measured with the default hashing embedder. The module's own docstring says they are not a quality claim, and that they should be raised as retrieval improves and never lowered to get CI green.
+
+The most recent run at this commit, with the hashing embedder and 32 questions at k=4, reported recall@4 1.000, MRR 1.000, nDCG@4 1.000, abstention accuracy 0.969 (one false answer, no false abstentions), and zero ACL leaks. Re-measure after any retrieval change. The same numbers were reproduced on 2026-11-03 at this commit, with the reranker off (its default).
 
 ## Consequences
 
@@ -47,6 +49,7 @@ Costs and risks:
 - **Thresholds can drift.** A threshold that is never raised stops telling you anything once the system improves. Re-measure after each retrieval change.
 - **Defaults can be mistaken for recommendations.** The extractive generator and the hashing embedder are there so the code runs offline. Neither is a recommended production choice. `docs/security.md` lists the changes a production deployment needs.
 - **Adapter contracts are only as strong as their tests.** The protocols do not enforce the ACL rule. The mandatory `access` argument and the retriever's post-check do, and the isolation tests exercise them (see ADR 0002).
+- **The live Claude path is not in CI.** `scripts/claude_smoke.py` checks it against the API and needs `ANTHROPIC_API_KEY`. The unit tests use a fake client.
 
 ## Alternatives considered
 

@@ -100,6 +100,9 @@ class MetricsRegistry:
         self.invalid_citations = self.counter(
             "fastrag_invalid_citations_total", "Citations to sources that were not provided"
         )
+        self.ungrounded = self.counter(
+            "fastrag_ungrounded_answers_total", "Answers that cite none of their sources"
+        )
 
     def counter(self, name: str, help_text: str) -> Counter:
         metric = Counter(name, help_text)

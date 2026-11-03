@@ -37,7 +37,9 @@ class CountingClaude(ClaudeGenerator):
 
 def main() -> int:
     # Answer cache off, so every ask reaches the generator.
-    settings = Settings.for_testing(cache_ttl_seconds=0, rate_limit_per_minute=0)
+    settings = Settings.for_testing(
+        cache_ttl_seconds=0, rate_limit_per_minute=0, user_rate_limit_per_minute=0
+    )
     service = RAGService.from_settings(settings, generator=CountingClaude())
     dataset = load_dataset("eval/golden")
     admin = Principal(dataset.tenant_id, "smoke-admin", roles=frozenset({Role.ADMIN}))

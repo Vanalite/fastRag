@@ -67,6 +67,9 @@ class DocumentIn:
     title: str = ""
     media_type: str = "text/plain"
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Who may replace or delete the document (ACL tokens). Empty means: keep the current
+    # editors on update, or the uploader alone on create. Admins can always edit.
+    editors: frozenset[str] = frozenset()
 
 
 def document_id(tenant_id: str, source_id: str) -> str:
@@ -86,6 +89,7 @@ class DocumentRecord:
     metadata: dict[str, Any]
     chunk_count: int
     updated_at: str
+    editors: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ class ScoredChunk:
     keyword_score: float | None = None  # BM25 score, if the keyword retriever found it
     keyword_coverage: float | None = None  # share of query terms present in the chunk
     keyword_matches: int | None = None  # how many distinct query terms matched
+    rerank_score: float | None = None  # set when a reranker reordered the results
 
 
 @dataclass(frozen=True)
@@ -142,6 +147,15 @@ class Answer:
     abstained: bool = False
     cached: bool = False
     usage: Usage = field(default_factory=Usage)
+
+    @property
+    def grounded(self) -> bool:
+        """An answer is grounded when it cites at least one source it was shown.
+
+        An ungrounded, non-abstained answer means the generator answered without
+        pointing at evidence - surface it to the user as unverified.
+        """
+        return not self.abstained and bool(self.citations)
 
 
 @dataclass(frozen=True)

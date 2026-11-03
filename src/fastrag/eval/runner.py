@@ -275,7 +275,9 @@ def run_eval(dataset_dir: str | Path, settings: Settings | None = None, k: int =
     settings = (settings or Settings.for_testing()).model_copy(
         update={"database_path": ":memory:", "audit_log_path": None, "api_keys_file": None}
     )
-    service = RAGService.from_settings(settings, limiter=RateLimiter(0, 0))
+    service = RAGService.from_settings(
+        settings, limiter=RateLimiter(0, 0), user_limiter=RateLimiter(0, 0)
+    )
 
     admin = Principal(dataset.tenant_id, "eval-admin", roles=frozenset({Role.ADMIN}))
     for doc in dataset.docs:

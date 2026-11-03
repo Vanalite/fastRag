@@ -25,6 +25,14 @@ class RateLimited(FastRagError):
         self.retry_after = retry_after
 
 
+class ConcurrentModification(FastRagError):
+    """The document changed between reading and writing it (HTTP 409).
+
+    Raised by stores when a write's expected version no longer matches; the ingest
+    service retries with fresh state, so callers only see it under heavy contention.
+    """
+
+
 class InvalidInput(FastRagError):
     """The request is well-formed but can't be processed (HTTP 422)."""
 

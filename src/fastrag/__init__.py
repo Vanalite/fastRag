@@ -1,6 +1,6 @@
 """fastRag: a reference implementation of an enterprise-grade RAG system."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from fastrag.config import Settings  # noqa: E402
 from fastrag.domain import (  # noqa: E402

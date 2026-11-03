@@ -10,8 +10,9 @@ from conftest import doc, make_principal
 from fastapi.testclient import TestClient
 
 from fastrag.api import create_app
-from fastrag.domain import Role, group_token
+from fastrag.domain import DocumentIn, Role, group_token
 from fastrag.errors import NotFound, PermissionDenied
+from fastrag.ratelimit import RateLimiter
 from fastrag.security.auth import ApiKeyStore, Authenticator, JwtVerifier
 
 SECRET = "s" * 40
@@ -184,9 +185,80 @@ def test_ingester_cannot_overwrite_or_delete_unreadable_doc(service, admin_a):
     assert service.audit.verify()
 
 
-def test_ingester_with_access_can_overwrite_and_delete(service, admin_a):
+def test_reading_does_not_grant_writing(service, admin_a):
+    # Ingrid can read the HR document, but she isn't one of its editors.
     ing = make_principal(user="ingrid", roles=(Role.INGESTER,), groups=("hr",))
     res = service.ingest(admin_a, doc("hr.txt", "HR table one.", acl=[group_token("hr")]))
+    assert service.search(ing, "HR table").chunks
+    with pytest.raises(PermissionDenied):
+        service.ingest(ing, doc("hr.txt", "HR table two.", acl=[group_token("hr")]))
+    with pytest.raises(NotFound):
+        service.delete(ing, res.doc_id)
+    assert service.store.get_document("tenant-a", res.doc_id).version == 1
+
+
+def test_listed_editor_can_overwrite_and_delete(service, admin_a):
+    ing = make_principal(user="ingrid", roles=(Role.INGESTER,), groups=("hr",))
+    first = DocumentIn(
+        "hr.txt", "HR table one.", frozenset({group_token("hr")}),
+        editors=frozenset({group_token("hr")}),
+    )  # fmt: skip
+    res = service.ingest(admin_a, first)
     assert service.ingest(ing, doc("hr.txt", "HR table two.", acl=[group_token("hr")])).version == 2
+    # Editors carry over when an update doesn't name them.
+    assert service.store.get_document("tenant-a", res.doc_id).editors == {group_token("hr")}
     service.delete(ing, res.doc_id)
     assert service.store.list_documents("tenant-a") == []
+
+
+def test_uploader_is_default_editor(service):
+    ing = make_principal(user="ingrid", roles=(Role.INGESTER,))
+    other = make_principal(user="olaf", roles=(Role.INGESTER,))
+    res = service.ingest(ing, doc("notes.txt", "Team notes v1."))
+    assert service.store.get_document("tenant-a", res.doc_id).editors == {"user:ingrid"}
+    assert service.ingest(ing, doc("notes.txt", "Team notes v2.")).version == 2
+    with pytest.raises(PermissionDenied):
+        service.ingest(other, doc("notes.txt", "Team notes hijacked."))
+
+
+def test_failed_logins_are_throttled_before_credentials_are_checked(make_service):
+    clock = [0.0]
+    limiter = RateLimiter(rate_per_minute=60, burst=3, clock=lambda: clock[0])
+    svc = make_service()
+    keys = ApiKeyStore()
+    good = keys.create(make_principal(user="ok"))
+    client = TestClient(create_app(svc, Authenticator(api_keys=keys), auth_failure_limiter=limiter))
+
+    def me(key):
+        return client.get("/v1/me", headers={"X-API-Key": key}).status_code
+
+    assert [me("frk_wrong") for _ in range(6)] == [401, 401, 401, 429, 429, 429]
+    entries = [e for e in svc.audit.sink.read() if e["action"] == "authenticate"]
+    # Three failures, then one aggregated entry for the throttled burst - not one per try.
+    assert [e["outcome"] for e in entries] == ["unauthenticated"] * 3 + ["throttled"]
+    assert entries[-1]["details"]["attempts"] == 1
+    # While throttled, even a valid key waits: the address can't keep guessing.
+    assert me(good) == 429
+    clock[0] += 2.0  # a token refills
+    assert me(good) == 200  # and success spends nothing
+    assert me(good) == 200
+
+
+def test_editors_cannot_change_who_may_read_or_edit(service, admin_a):
+    ing = make_principal(user="ingrid", roles=(Role.INGESTER,), groups=("hr",))
+    hr_only = frozenset({group_token("hr")})
+    res = service.ingest(admin_a, DocumentIn("hr.txt", "HR table one.", hr_only, editors=hr_only))
+    # Content updates are fine...
+    service.ingest(ing, DocumentIn("hr.txt", "HR table two.", hr_only))
+    # ...but publishing to the whole tenant, or granting edit rights, needs an admin.
+    with pytest.raises(PermissionDenied):
+        service.ingest(ing, DocumentIn("hr.txt", "HR table two.", frozenset({"tenant:*"})))
+    with pytest.raises(PermissionDenied):
+        service.ingest(
+            ing, DocumentIn("hr.txt", "HR v3.", hr_only, editors=frozenset({"tenant:*"}))
+        )
+    record = service.store.get_document("tenant-a", res.doc_id)
+    assert record.acl == hr_only and record.editors == hr_only and record.version == 2
+    # An admin can.
+    service.ingest(admin_a, DocumentIn("hr.txt", "HR table two.", frozenset({"tenant:*"})))
+    assert service.store.get_document("tenant-a", res.doc_id).acl == {"tenant:*"}

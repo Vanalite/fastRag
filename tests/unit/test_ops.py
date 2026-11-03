@@ -35,10 +35,10 @@ def test_cache_ttl_and_lru():
     clock = Clock()
     cache = AnswerCache(ttl_seconds=10, max_entries=2, clock=clock)
     answer = Answer(text="x", citations=[], sources=[])
-    cache.put("a", answer)
-    cache.put("b", answer)
+    cache.put("a", answer, "acme")
+    cache.put("b", answer, "acme")
     cache.get("a")
-    cache.put("c", answer)  # evicts b, the least recently used
+    cache.put("c", answer, "acme")  # evicts b, the least recently used
     assert cache.get("b") is None and cache.get("a") is answer
     clock.now = 11
     assert cache.get("a") is None

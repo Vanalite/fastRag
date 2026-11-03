@@ -17,7 +17,8 @@ from pathlib import Path
 import numpy as np
 
 from fastrag.domain import Chunk, DocumentRecord
-from fastrag.errors import ConfigurationError
+from fastrag.errors import ConcurrentModification, ConfigurationError
+from fastrag.storage.base import UNCHECKED
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS documents (
     title        TEXT NOT NULL,
     version      INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
-    acl          TEXT NOT NULL,   -- JSON array of ACL tokens
+    acl          TEXT NOT NULL,   -- JSON array of ACL tokens (who may read)
+    editors      TEXT NOT NULL DEFAULT '[]',  -- JSON array of ACL tokens (who may write)
     metadata     TEXT NOT NULL,   -- JSON object
     chunk_count  INTEGER NOT NULL,
     updated_at   TEXT NOT NULL,
@@ -71,10 +73,43 @@ class SQLiteDocumentStore:
             # Deleted content is overwritten with zeros rather than left in free pages.
             self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # --- schema migrations ----------------------------------------------------
+    # Each step upgrades a database created by an older version, in place. Steps are
+    # additive and idempotent; the applied version is recorded in `meta`.
+
+    SCHEMA_VERSION = 2
+
+    def _migrate(self) -> None:
+        # BEGIN IMMEDIATE takes the write lock first, so two processes opening an old
+        # database at once can't both run the same ALTER TABLE.
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            version = int(row["value"]) if row else 1
+            if version > self.SCHEMA_VERSION:
+                raise ConfigurationError(
+                    f"database schema v{version} is newer than this release supports "
+                    f"(v{self.SCHEMA_VERSION}); upgrade fastrag instead of downgrading data"
+                )
+            if version < 2:
+                columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(documents)")}
+                if "editors" not in columns:
+                    self._conn.execute(
+                        "ALTER TABLE documents ADD COLUMN editors TEXT NOT NULL DEFAULT '[]'"
+                    )
+            if version != self.SCHEMA_VERSION:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    (str(self.SCHEMA_VERSION),),
+                )
 
     # --- metadata ----------------------------------------------------------
 
@@ -143,11 +178,16 @@ class SQLiteDocumentStore:
     # --- writes ------------------------------------------------------------
 
     def replace_document(
-        self, record: DocumentRecord, chunks: list[Chunk], embeddings: np.ndarray
+        self,
+        record: DocumentRecord,
+        chunks: list[Chunk],
+        embeddings: np.ndarray,
+        expected_version: int | None | object = UNCHECKED,
     ) -> list[str]:
         if embeddings.shape[0] != len(chunks):
             raise ValueError("one embedding per chunk is required")
         with self._lock, self._transaction():
+            self._check_version(record.tenant_id, record.doc_id, expected_version)
             old_ids = self._chunk_ids(record.tenant_id, record.doc_id)
             self._conn.execute(
                 "DELETE FROM chunks WHERE tenant_id = ? AND doc_id = ?",
@@ -156,13 +196,14 @@ class SQLiteDocumentStore:
             self._conn.execute(
                 """
                 INSERT INTO documents (tenant_id, doc_id, source_id, title, version, content_hash,
-                                       acl, metadata, chunk_count, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                       acl, editors, metadata, chunk_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (tenant_id, doc_id) DO UPDATE SET
                     source_id = excluded.source_id, title = excluded.title,
                     version = excluded.version, content_hash = excluded.content_hash,
-                    acl = excluded.acl, metadata = excluded.metadata,
-                    chunk_count = excluded.chunk_count, updated_at = excluded.updated_at
+                    acl = excluded.acl, editors = excluded.editors,
+                    metadata = excluded.metadata, chunk_count = excluded.chunk_count,
+                    updated_at = excluded.updated_at
                 """,
                 (
                     record.tenant_id,
@@ -172,6 +213,7 @@ class SQLiteDocumentStore:
                     record.version,
                     record.content_hash,
                     json.dumps(sorted(record.acl)),
+                    json.dumps(sorted(record.editors)),
                     json.dumps(record.metadata, sort_keys=True),
                     len(chunks),
                     record.updated_at or _now(),
@@ -197,8 +239,11 @@ class SQLiteDocumentStore:
             )
         return old_ids
 
-    def delete_document(self, tenant_id: str, doc_id: str) -> list[str] | None:
+    def delete_document(
+        self, tenant_id: str, doc_id: str, expected_version: int | None | object = UNCHECKED
+    ) -> list[str] | None:
         with self._lock, self._transaction():
+            self._check_version(tenant_id, doc_id, expected_version)
             exists = self._conn.execute(
                 "SELECT 1 FROM documents WHERE tenant_id = ? AND doc_id = ?", (tenant_id, doc_id)
             ).fetchone()
@@ -216,6 +261,19 @@ class SQLiteDocumentStore:
         return ids
 
     # --- helpers -----------------------------------------------------------
+
+    def _check_version(self, tenant_id: str, doc_id: str, expected: int | None | object) -> None:
+        """Compare-and-set: fail if another writer changed the document since it was read."""
+        if expected is UNCHECKED:
+            return
+        row = self._conn.execute(
+            "SELECT version FROM documents WHERE tenant_id = ? AND doc_id = ?", (tenant_id, doc_id)
+        ).fetchone()
+        current = row["version"] if row else None
+        if current != expected:
+            raise ConcurrentModification(
+                f"document {doc_id!r} is at version {current}, expected {expected}"
+            )
 
     def _chunk_ids(self, tenant_id: str, doc_id: str) -> list[str]:
         rows = self._conn.execute(
@@ -257,6 +315,7 @@ def _record(row: sqlite3.Row) -> DocumentRecord:
         version=row["version"],
         content_hash=row["content_hash"],
         acl=frozenset(json.loads(row["acl"])),
+        editors=frozenset(json.loads(row["editors"])),
         metadata=json.loads(row["metadata"]),
         chunk_count=row["chunk_count"],
         updated_at=row["updated_at"],

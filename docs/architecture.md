@@ -3,9 +3,12 @@
 **Last updated:** 2026-11-03
 **Entry points:** `src/fastrag/api/app.py` (HTTP), `src/fastrag/cli.py` (operator CLI), `src/fastrag/service.py` (`RAGService`, the only path to data)
 
-> **Code state.** This page describes the code after the pending changes (confidence gate, generation ordering, content-hashed chunk ids, structured citations, API error envelope). Line numbers below are from the pre-change code and will drift. Function and file names are stable.
+Every operation, whether it comes from HTTP, the CLI or the evaluation harness, goes through `RAGService`. Each call follows the same sequence in `RAGService._operation`: rate limit (user bucket, then tenant bucket), authorize (RBAC), do the work with an access filter, then audit, count and trace the outcome in a `finally` block. This page names modules and functions, not line numbers.
 
-fastRag is a single-process reference system. Every operation, whether it comes from HTTP, the CLI or the evaluation harness, goes through `RAGService`. That class enforces the same sequence each time: authorize, rate-limit, do the work with an access filter, then audit and count the outcome.
+There are two deployment shapes, and the same code runs both:
+
+- **SQLite (default).** One file is the system of record, and each process keeps its own in-memory indexes. One process per host.
+- **Postgres with pgvector (`FASTRAG_POSTGRES_DSN`).** The tables are the system of record and the search indexes, so several replicas see the same data. Redis (`FASTRAG_REDIS_URL`) optionally shares rate limits and the answer cache. See [adr/0007-postgres-storage.md](adr/0007-postgres-storage.md).
 
 ## Component diagram
 
@@ -13,23 +16,26 @@ fastRag is a single-process reference system. Every operation, whether it comes 
 flowchart TB
     client["HTTP client or CLI"]
     subgraph edge["Edge: src/fastrag/api/app.py, src/fastrag/cli.py"]
-        api["FastAPI routes and error-to-status mapping"]
-        auth["Authenticator: hashed API keys or HS256 JWT (security/auth.py)"]
+        api["FastAPI routes, error mapping, auth-failure throttle"]
+        auth["Authenticator: API keys, or bearer JWT and OIDC (security/auth.py)"]
     end
     subgraph core["RAGService: src/fastrag/service.py"]
-        op["_operation: RBAC, rate limit, audit, metrics"]
-        cache["AnswerCache (cache.py)"]
+        op["_operation: rate limits, RBAC, audit, metrics, tracing"]
         ingest["IngestService (ingest/service.py)"]
-        retr["Retriever (retrieval/retriever.py)"]
-        gen["Generator: extractive (default) or claude"]
+        retr["Retriever (retrieval/retriever.py) and optional Reranker (retrieval/rerank.py)"]
+        gen["Generator: extractive (default) or claude, both with stream()"]
+        cache["Answer cache (cache.py): in process or Redis"]
     end
     subgraph storage["Storage: src/fastrag/storage/"]
-        store[("SQLiteDocumentStore: system of record")]
-        idx["SearchIndexes: NumpyVectorIndex and BM25Index (derived, in memory)"]
+        sqlite[("SQLite file: system of record (default)")]
+        pg[("Postgres: documents, chunks, tenant_generation (postgres.py)")]
+        mem["NumPy and BM25 indexes, in memory (SQLite only, derived)"]
     end
-    subgraph obs["Observability: src/fastrag/observability/"]
-        audit["AuditLog: hash-chained JSONL"]
+    redis[("Redis, optional: rate-limit buckets and answer cache")]
+    subgraph obs["Observability"]
+        audit["AuditLog: hash-chained JSONL, one file per host"]
         metrics["MetricsRegistry: Prometheus text"]
+        tracing["OpenTelemetry spans (observability/tracing.py), no-op without the package"]
     end
     emb["Embedder: hashing (default) or sentence-transformers"]
     llm["Anthropic Messages API (optional)"]
@@ -42,18 +48,23 @@ flowchart TB
     op --> gen
     op --> audit
     op --> metrics
-    ingest --> store
-    ingest --> idx
+    op --> tracing
+    ingest --> sqlite
+    ingest --> pg
+    ingest --> mem
+    retr --> mem
+    retr --> pg
     ingest --> emb
-    retr --> idx
     retr --> emb
-    store -. "rebuild at startup" .-> idx
+    sqlite -. "rebuild at startup" .-> mem
+    op -.-> redis
+    cache -.-> redis
     gen -->|"generator=claude"| llm
 ```
 
 ## Request lifecycle: `POST /v1/ask`
 
-Code order in `RAGService.ask` (`src/fastrag/service.py`, `ask`). The ACL pre-filter runs inside each index search, not as a separate step.
+`POST /v1/ask/stream` runs the same steps through `RAGService.ask_stream`. The ACL pre-filter runs inside each index search, not as a separate step.
 
 ```mermaid
 sequenceDiagram
@@ -61,56 +72,52 @@ sequenceDiagram
     participant C as Client
     participant A as API (api/app.py)
     participant S as RAGService (service.py)
-    participant ST as SQLiteDocumentStore
-    participant K as AnswerCache (cache.py)
-    participant RT as Retriever and SearchIndexes
+    participant ST as Store (SQLite or Postgres)
+    participant K as Answer cache
+    participant RT as Retriever and indexes
     participant G as Generator
     participant AU as AuditLog
-    participant M as MetricsRegistry
 
     C->>A: POST /v1/ask with Bearer token or X-API-Key
-    A->>A: Authenticator.authenticate, else 401 (audited as unauthenticated)
+    A->>A: Failure budget for this address empty? 429 before checking credentials. Otherwise authenticate, and a failure is 401, audited as unauthenticated
     A->>S: ask(principal, question, k)
-    S->>S: require(principal, QUERY), else 403
-    S->>S: limiter.check(tenant_id), else 429
-    S->>S: validate question and k, else 422
+    S->>S: user bucket, then tenant bucket (429), then require QUERY (403), then validate (422)
     S->>S: AccessFilter.for_principal (tenant plus ACL tokens)
     S->>ST: generation(tenant_id)
-    S->>K: get(sha256 of scope_key, generation, k, normalized question)
-    alt cache hit and not expired
+    S->>K: get(sha256 of scope, generation, k, normalized question)
+    alt cache hit
         K-->>S: cached Answer
     else miss
         S->>RT: retrieve(question, access, k)
-        Note over RT: dense and BM25 both pre-filter by access, then RRF, then a defence-in-depth ACL check
-        RT-->>S: RetrievalResult (chunks, confident)
-        S->>S: prune chunks that pass neither the dense nor the keyword signal
-        S->>S: flag chunks matching injection heuristics (drop only if configured)
-        S->>S: recompute confidence over the remaining chunks
-        alt not confident, or no sources left
+        Note over RT: Dense and keyword search pre-filter by access, then RRF, reranker if set, ACL re-check, exact-duplicate removal
+        RT-->>S: chunks, confident
+        S->>S: keep chunks with a raw dense or keyword signal (Retriever.supports), then flag injection heuristics
+        alt no sources left
             S->>S: abstain, no LLM call
         else
-            S->>G: generate(question, sources)
-            G-->>S: text, usage, structured citations
-            S->>S: validate citations (drop indices outside 1..n)
-            S->>S: record token metrics
+            S->>S: redact PII in the question sent to the LLM (FASTRAG_REDACT_QUESTIONS)
+            S->>G: generate(question, sources), or stream() for /v1/ask/stream
+            G-->>S: text, usage, citations
+            S->>S: validate citations, set grounded, count tokens
         end
         S->>K: put(key, answer)
     end
-    S->>AU: record(ask, outcome) in finally, with ids and hashes only
-    S->>M: requests counter and stage latency in finally
+    S->>AU: record(ask, outcome) in finally: ids and hashes only
     S-->>A: Answer
     A-->>C: 200 AskResponse
 ```
 
-Notes on the order:
+Notes on the order and the streaming path:
 
-- Pruning and injection flagging run **before** the final confidence decision. Confidence is recomputed after suspicious chunks are dropped, so a result that only had flagged evidence abstains instead of generating from nothing.
-- The cache key reads the corpus generation **before** retrieval. That is safe now because the generation is bumped only after the indexes are updated (see the next section). A stale answer can only land under an old key.
+- Pruning and injection flagging run **before** the abstain decision. A result whose only evidence was flagged (with dropping enabled) abstains instead of generating from nothing.
+- The cache key reads the corpus generation **before** retrieval, so a stale answer can only land under an old key.
+- **Streaming.** `ask_stream` yields `delta` events (raw model text, not yet validated), then one `answer` event with the validated text and citations. The endpoint runs to the first event before it responds, so errors before the stream starts are ordinary HTTP errors. Later failures become in-band `error` events, and an abandoned stream is audited as `cancelled`.
 - Audit and metrics run in the `finally` of `_operation`. They fire on success, denial and error alike. If the audit write fails on an otherwise successful call, the request fails (fail closed).
+- `Answer.grounded` is false when a non-abstained answer cites nothing. It is counted in `fastrag_ungrounded_answers_total` (generated answers only, not cache hits) and audited as `ungrounded: true`. The audit outcome stays `success`.
 
 ## Ingest and delete lifecycle
 
-The store is the single source of truth. The indexes are projections of it.
+The store is the system of record. The indexes are projections of it.
 
 ```mermaid
 sequenceDiagram
@@ -118,114 +125,128 @@ sequenceDiagram
     participant C as Client
     participant S as RAGService
     participant I as IngestService (ingest/service.py)
-    participant ST as SQLiteDocumentStore
-    participant IX as SearchIndexes
+    participant ST as Store
+    participant IX as Indexes
+    participant K as Answer cache
 
     C->>S: POST /v1/documents (or DELETE /v1/documents/{id})
-    S->>S: require(INGEST or DELETE). Rate limit is skipped for writes.
-    S->>I: ingest(tenant, doc, can_modify) or delete(tenant, doc_id, can_modify)
-    I->>I: validate source_id, non-empty and valid ACL tokens, size limit
-    I->>I: parse media type, then PII redaction if enabled
-    I->>I: content hash over text, title, ACL, metadata, chunk params
-    I->>I: take striped lock for (tenant, doc_id)
-    I->>ST: get_document
-    alt existing and caller cannot modify
-        I-->>S: PermissionDenied (403)
-    else identical content hash
-        I-->>S: status unchanged, no writes
-    else new or changed
-        I->>I: chunk, then embed (title prefixed to each chunk)
-        I->>ST: replace_document: one transaction. Delete old chunks, upsert document, insert chunks.
-        ST-->>I: old chunk ids
-        I->>IX: apply(remove old ids, add new chunks), under one lock
-        I->>ST: bump_generation(tenant), after the indexes are updated
+    S->>S: rate limits, require(INGEST or DELETE)
+    S->>I: ingest(...) or delete(...)
+    I->>I: validate, parse, PII redaction, content hash
+    loop up to MAX_WRITE_ATTEMPTS (3)
+        I->>I: striped lock for (tenant, doc_id), this process only
+        I->>ST: get_document, then can_modify (403) and sharing rule
+        alt identical content hash
+            I-->>S: unchanged, no writes
+        else new or changed
+            I->>ST: replace_document(expected_version), one transaction
+            alt stored version differs (another writer)
+                ST-->>I: ConcurrentModification, retry with fresh state
+            else committed
+                I->>IX: apply(remove old ids, add new chunks), no-op on Postgres
+                I->>ST: bump_generation(tenant)
+            end
+        end
     end
+    S->>K: invalidate_tenant (after a changed ingest, or a delete)
 ```
 
-Delete has the same shape. `SQLiteDocumentStore.delete_document` removes the document in one transaction and cascades to its chunks. It then calls `indexes.apply(remove_ids=...)`, and only after that does `IngestService` bump the tenant generation. If the document is absent or not modifiable, the service returns `NotFound`, the same response in both cases.
+Delete follows the same shape: `delete_document(expected_version)`, then `indexes.apply(remove_ids=...)`, then `bump_generation`. An absent or non-modifiable document gives the same `NotFound`.
 
-**Why the order matters.** The generation is part of every cache key. If it were bumped at commit, a query that ran between the commit and the index update could cache an answer built from the old indexes under the new generation, and serve it until the TTL expired. Bumping after the index update closes that window.
+- **Order matters.** The generation is part of every cache key. Bumping it only after the indexes are updated means a query cannot cache an answer built from the old indexes under the new generation. On Postgres the rows are the index, so the bump follows the commit.
+- **Concurrency.** `replace_document` and `delete_document` take the expected version, and the store raises `ConcurrentModification` on a mismatch (HTTP 409 once retries run out). Postgres also holds a transaction-scoped advisory lock per document, so writers on different replicas serialize. `MAX_WRITE_ATTEMPTS` is 3, and each retry re-checks permissions.
+- **Cache purge.** After a changed ingest or a delete, `invalidate_tenant` removes that tenant's cached answers from this process (or from Redis) at once. The generation keys are the second guard.
+- **Startup.** SQLite: `RAGService.from_settings` creates empty indexes and calls `SearchIndexes.rebuild_from(store)`, so a restart is a full resynchronization. Postgres: no rebuild. Migrations run when the store is constructed, unless `FASTRAG_POSTGRES_MIGRATE_ON_START=false`, in which case the schema is only checked and `fastrag db migrate` applies migrations.
 
-**Startup rebuild.** `RAGService.from_settings` opens the store, checks the embedder name, creates empty indexes, then calls `SearchIndexes.rebuild_from(store)` (`service.py:110-119`, `storage/indexes.py:43-52`). Restarting the process is therefore always a full resynchronization.
-
-**Known gap.** Nothing reconciles the indexes with the store while the process runs. `SearchIndexes.consistent_with` exists (`storage/indexes.py:66-70`), but only the tests call it. If `indexes.apply` fails after a commit, the in-memory indexes stay stale until restart.
+**Known gap (SQLite only).** Other processes on the same file do not see a change until they restart. A delete is therefore still served by a second process, and its answers can be cached under the new generation. Use Postgres for more than one process. If `indexes.apply` fails after a commit, the indexes stay stale until restart.
 
 ## Data model
 
-### Persistent (SQLite, `src/fastrag/storage/sqlite.py:22-55`)
+### Persistent: SQLite (`src/fastrag/storage/sqlite.py`)
 
 | Table | Key | Columns | Notes |
 |---|---|---|---|
-| `meta` | `key` | `value` | Stores the `embedder` name. A different embedder at startup is a `ConfigurationError` (`sqlite.py:79-88`). |
-| `documents` | `(tenant_id, doc_id)` | `source_id`, `title`, `version`, `content_hash`, `acl` (JSON array), `metadata` (JSON), `chunk_count`, `updated_at` | ACL lives here only. Chunks inherit it at load time (`iter_chunks`). |
-| `chunks` | `chunk_id` | `tenant_id`, `doc_id`, `version`, `ordinal`, `text`, `embedding` (float32 LE BLOB) | FK to `documents` with `ON DELETE CASCADE`. Index `chunks_by_doc`. Ids include the content hash. |
-| `tenant_generation` | `tenant_id` | `generation` | Incremented by `bump_generation` after the indexes are updated, for every document write or delete. Used for cache invalidation. |
+| `meta` | `key` | `value` | `embedder` (a different embedder at startup is a `ConfigurationError`) and `schema_version` (2). |
+| `documents` | `(tenant_id, doc_id)` | `source_id`, `title`, `version`, `content_hash`, `acl` (JSON array), `editors` (JSON array), `metadata` (JSON), `chunk_count`, `updated_at` | ACL lives here only. Chunks inherit it at load time (`iter_chunks`). |
+| `chunks` | `chunk_id` | `tenant_id`, `doc_id`, `version`, `ordinal`, `text`, `embedding` (float32 LE BLOB) | FK to `documents` with `ON DELETE CASCADE`. Index `chunks_by_doc`. |
+| `tenant_generation` | `tenant_id` | `generation` | Bumped after the indexes are updated. Used for cache keys. |
 
-Identifiers:
+`SQLiteDocumentStore._migrate` upgrades a version 1 database in place. Migrated documents have empty `editors`, so only admins can change them.
 
-- `doc_id` = first 24 hex chars of `sha256(tenant_id NUL source_id)` (`src/fastrag/domain.py:72-74`). Equal source ids in different tenants never collide.
-- `chunk_id` = first 32 hex chars of a SHA-256 over tenant, `doc_id`, version, ordinal **and the content hash** (`src/fastrag/ingest/service.py`). The content hash covers `PIPELINE_VERSION`, the embedder name, the text, the title, the ACL, the metadata and the chunk parameters. A change to any of them produces new chunk ids, so a stale chunk id can never refer to new content.
-- `BM25Index` indexes the title together with the text.
-- `version` is a counter. Old chunks are deleted in the same transaction (`sqlite.py:150-153`), so there is **no version history** in the store.
+### Persistent: Postgres (`src/fastrag/storage/postgres.py`)
 
-### In memory (derived, rebuilt at startup)
+Tables `documents` (`acl` and `editors` as `text[]`, `metadata` as `jsonb`), `chunks` (denormalized `acl`, plus `embedding vector(dim)` and `tsv`, with a foreign key to `documents`), `tenant_generation`, and `meta` (`schema_version`, `embedder`, `embedding_dim`). Indexes: btree on `(tenant_id, doc_id)`, GIN on `acl` and `tsv`, HNSW on `embedding` (skipped above 2000 dimensions). Details are in ADR 0007.
 
-- `NumpyVectorIndex` (`src/fastrag/storage/vector.py`): one partition per tenant, holding a float32 matrix and a parallel list of `Chunk`.
-- `BM25Index` (`src/fastrag/storage/bm25.py`): one partition per tenant, holding term postings, document lengths and chunks. Term statistics are per tenant.
-- `AnswerCache` (`src/fastrag/cache.py`): an `OrderedDict` with TTL and LRU eviction, per process.
-- `RateLimiter` buckets (`src/fastrag/ratelimit.py`): per process, keyed by tenant.
-- `ApiKeyStore` (`src/fastrag/security/auth.py`): hash-to-principal map, loaded from file at startup.
+### Identifiers
+
+- `doc_id` = first 24 hex chars of `sha256(tenant_id NUL source_id)` (`domain.document_id`). Equal source ids in different tenants never collide.
+- `chunk_id` = first 32 hex chars of a SHA-256 over tenant, `doc_id`, version, ordinal **and the content hash** (`IngestService.ingest`). The content hash covers `PIPELINE_VERSION`, the embedder name, text, title, ACL, editors, metadata and chunk parameters, so a stale chunk id never refers to new content.
+- `version` is a counter. Old chunks are deleted in the same transaction, so there is **no version history**.
+
+### What is per process
+
+| Component | SQLite deployment | Postgres (+ Redis) deployment |
+|---|---|---|
+| Documents, chunks and search indexes | File plus in-memory NumPy and BM25 (`storage/vector.py`, `storage/bm25.py`) in each process. Other processes miss writes until restart. | The tables. Every replica queries the same rows. |
+| Answer cache (`cache.py`) | Per process (`AnswerCache`). | Per process unless Redis (`RedisAnswerCache`). Without Redis, other replicas' entries for a deleted document stay in memory until TTL or restart; generation keys keep them unreachable. |
+| Rate limits and auth-failure throttle (`ratelimit.py`) | Per process. | Per process unless Redis (`RedisRateLimiter`). N replicas allow N times the configured rate. |
+| API keys (`security/auth.py`) | Keys file, re-read on change. | Each replica needs the keys file (shared storage or distributed). |
+| Reranker model | Loaded in each process at startup. | Same. |
+| Audit log (`observability/audit.py`) | One JSONL file per host. | Still one file per host: the audit chain is not in Postgres. |
 
 ### Files
 
 | Path (defaults) | Setting | Contents |
 |---|---|---|
-| `.fastrag/fastrag.db` (+ `-wal`, `-shm`) | `FASTRAG_DATABASE_PATH` | SQLite system of record |
-| `.fastrag/api_keys.json` | `FASTRAG_API_KEYS_FILE` | Key hashes and principals, mode 0600 |
-| `.fastrag/audit.jsonl` | `FASTRAG_AUDIT_LOG_PATH` | Hash-chained audit entries |
+| `.fastrag/fastrag.db` (+ `-wal`, `-shm`) | `FASTRAG_DATABASE_PATH` | SQLite system of record, mode 0600. Not used when `FASTRAG_POSTGRES_DSN` is set. |
+| `.fastrag/api_keys.json` (+ `.lock`, `.tmp`) | `FASTRAG_API_KEYS_FILE` | Key hashes, ids, expiry and revocation, mode 0600. The writer lock and temporary file sit beside it. |
+| `.fastrag/audit.jsonl` | `FASTRAG_AUDIT_LOG_PATH` | Hash-chained audit entries, mode 0600. |
 
-Audit entry shape (`src/fastrag/observability/audit.py:111-122`): `ts`, `request_id`, `action`, `outcome`, `tenant_id`, `user_id`, `details`, `prev_hash`, `hash`.
+Audit entry shape (`observability/audit.py`, `AuditLog.record`): `ts`, `request_id`, `action`, `outcome`, `tenant_id`, `user_id`, `details`, `prev_hash`, `hash`.
 
 ## Where each enterprise concern lives
 
-| Concern | Module and location |
+| Concern | Module and function |
 |---|---|
-| Authentication (API keys, JWT) | `security/auth.py` (`Authenticator`, `ApiKeyStore`, `JwtVerifier`), called from `api/app.py:92-106` |
-| Action authorization (RBAC) | `security/rbac.py` (`require`), called from `service.py:278` |
+| Authentication (API keys, bearer tokens) | `security/auth.py` (`Authenticator.authenticate`, `ApiKeyStore`, `JwtVerifier`, `OidcVerifier`), called from `api/app.py` (`current_principal`) |
+| Token claim mapping and lifetime | `security/auth.py` (`ClaimMapping`, `_principal_from_claims`, `_check_lifetime`) |
+| Auth-failure throttle | `api/app.py` (`current_principal`), `ratelimit.py` (in process or Redis) |
+| Action authorization (RBAC) | `security/rbac.py` (`require`), called from `service.py` (`_operation`) |
+| Write authorization and sharing rule | `service.py` (`_can_modify`), `ingest/service.py` (`ingest`, `can_change_sharing`) |
+| Optimistic concurrency | `storage/base.py` (`UNCHECKED`), `errors.py` (`ConcurrentModification`), `storage/sqlite.py` and `storage/postgres.py` (`_check_version`), `ingest/service.py` (`MAX_WRITE_ATTEMPTS`) |
 | Document ACLs and tokens | `domain.py` (`EVERYONE`, `Principal.acl_tokens`), `security/acl.py` (`AccessFilter.allows`) |
-| Tenant isolation | `storage/vector.py:58`, `storage/bm25.py:82` (per-tenant partitions), `domain.py:72-74`, `storage/sqlite.py` PK `(tenant_id, doc_id)` |
-| ACL enforcement at query time | `storage/vector.py:61-65`, `storage/bm25.py:100` (pre-filter), `retrieval/retriever.py:57-61` (post-check) |
-| Rate limiting | `ratelimit.py`, `service.py:279-280` (queries only) |
-| Answer caching | `cache.py` (key includes scope and generation), `service.py:197-205`, `:246` |
-| PII redaction | `ingest/redact.py`, `ingest/service.py:84-87` |
-| Prompt-injection defense | `generation/prompt.py`, `service.py:209-214` |
-| Citation validation | `generation/citations.py`, `service.py` (structured citations from the generator) |
-| Confidence gate and abstention | `retrieval/retriever.py` (pruning and gate), `service.py` (recompute after drop, abstain) |
-| Audit trail | `observability/audit.py`, `service.py:305-310` |
-| Metrics | `observability/metrics.py`, `service.py:306-308` and call sites |
-| Structured logs and request ids | `observability/logging.py`, `api/app.py:63-74` |
-| Error-to-HTTP mapping | `errors.py`, `api/app.py:45-90` |
-| Config validation | `config.py` (`Settings`, `_check`) |
-| Embedder pinning | `storage/sqlite.py:79-88` |
-| Index rebuild on startup | `service.py:118-119`, `storage/indexes.py:43-52` |
-| Secure delete of content | `storage/sqlite.py:70` (file databases only) |
-| Credential file permissions | `security/auth.py:101-105` |
+| Tenant isolation | Per-tenant partitions in `storage/vector.py` and `storage/bm25.py`; `WHERE tenant_id` in `storage/postgres.py`; `domain.py` (`document_id`) |
+| ACL enforcement at query time | Pre-filter in `storage/vector.py`, `storage/bm25.py`, and the SQL `WHERE` in `storage/postgres.py`; post-check in `retrieval/retriever.py` |
+| Rate limiting | `ratelimit.py` (`RateLimiter`, `RedisRateLimiter`), `service.py` (`_operation`) |
+| Answer caching and purge | `cache.py` (`cache_key`, `AnswerCache`, `RedisAnswerCache`), `service.py` (`ask`, `ingest`, `delete`) |
+| Hybrid retrieval and reranking | `retrieval/retriever.py` (`retrieve`, `supports`), `retrieval/rerank.py` (`CrossEncoderReranker`, `get_reranker`) |
+| Streaming | `service.py` (`ask_stream`, `AskEvent`), `api/app.py` (`ask_stream`, `_EventStream`), `generation/claude.py` (`stream`) |
+| PII redaction | `ingest/redact.py` (`Redactor`); `ingest/service.py` (ingest); `service.py` (`_outbound_question`, questions) |
+| Prompt-injection defense | `generation/prompt.py`, `service.py` (`ask`) |
+| Citation validation and grounding | `generation/citations.py`, `service.py` (`_grounded_answer`), `domain.py` (`Answer.grounded`) |
+| Confidence gate and abstention | `retrieval/retriever.py` (`supports`), `service.py` (`_ask`) |
+| Audit trail | `observability/audit.py` (`JsonlAuditSink`, `AuditLog`), `service.py` (`_operation`) |
+| Metrics, tracing, logs and request ids | `observability/metrics.py`, `observability/tracing.py` (`start_span`, `end_span`), `observability/logging.py`, `api/app.py` (`request_context`) |
+| Error-to-HTTP mapping | `errors.py`, `api/app.py` (`domain_error`, `_STATUS`) |
+| Config validation and production mode | `config.py` (`Settings._check`, `Settings._check_production`) |
+| Embedder pinning | `storage/sqlite.py` and `storage/postgres.py` (`check_embedder`) |
+| Index rebuild on startup (SQLite) | `service.py` (`from_settings`), `storage/indexes.py` (`rebuild_from`) |
 
-## Extension points and what is not implemented
-
-These are documented as extension points. None of them is implemented in the code.
+## Extension points and status
 
 | Capability | Status |
 |---|---|
-| OIDC or JWKS verification (RS256 or ES256) | Not implemented. `security/auth.py:8-10` describes the swap. Only HS256 with a shared secret is verified. |
-| pgvector or Postgres storage | Not implemented. Interfaces are in `storage/base.py`, and the SQLite schema maps to Postgres. |
-| Postgres row-level security | Not implemented. See ADR 0002. |
-| Reranker or MMR diversification | Not implemented. |
+| OIDC or JWKS verification (RS256, ES256, PS256) | Implemented: `OidcVerifier`, enabled by `FASTRAG_OIDC_JWKS_URL`. HS256 remains for service tokens and demos. |
+| Postgres + pgvector storage and indexes | Implemented, opt-in (`FASTRAG_POSTGRES_DSN`). The integration suite has not yet passed end to end. See ADR 0007. |
+| Postgres row-level security | Not enabled. Described in `docs/operations.md`. |
+| Redis rate limits and answer cache | Implemented, opt-in (`FASTRAG_REDIS_URL`). |
+| Reranker | Implemented, opt-in: `CrossEncoderReranker` (`FASTRAG_RERANKER`). Off by default. |
+| Streaming responses | Implemented: `POST /v1/ask/stream`. |
+| OpenTelemetry spans | Implemented, opt-in with `fastrag[otel]` and an SDK configured by the deployment. No `FASTRAG_` setting. |
+| MMR diversification | Not implemented. Exact-duplicate removal is implemented (`Retriever.retrieve`). |
+| Token revocation before `exp` | Not implemented. Lifetimes are capped at 24 hours. |
 | Async ingestion queue | Not implemented. Ingest runs inline in the request. |
-| Streaming responses | Not implemented. |
-| Redis-backed rate limiting or cache | Not implemented. `ratelimit.py:3-5` describes the swap. |
-| OpenTelemetry tracing | Not implemented. Correlation uses `request_id` only. |
-| Multi-replica deployment | Not supported. Each process holds its own indexes and cache. See `docs/operations.md`. |
-| `fastrag eval` regression gate | Present. `src/fastrag/eval/` runs the golden set in `eval/golden/` and exits 0 (pass), 1 (gate failure) or 2 (error). It is a regression gate, not a quality claim. See ADR 0006. |
+| Multi-replica deployment | Supported with Postgres and Redis (see `docs/operations.md`). SQLite is single-process. |
+| `fastrag eval` regression gate | Present. Runs the golden set in `eval/golden/`, exit 0 pass, 1 gate failure, 2 error. A regression gate, not a quality claim (ADR 0006). |
 
-Related docs: [security.md](security.md), [operations.md](operations.md), [adr/0001-single-source-of-truth.md](adr/0001-single-source-of-truth.md).
+Related docs: [security.md](security.md), [operations.md](operations.md), [adr/0001-single-source-of-truth.md](adr/0001-single-source-of-truth.md), [adr/0007-postgres-storage.md](adr/0007-postgres-storage.md).

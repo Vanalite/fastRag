@@ -11,21 +11,21 @@ Documents are written by many people, and some of them are not trustworthy: an e
 
 Four layers, each in its own place. The prompt-injection boundary is documented at the top of `src/fastrag/generation/prompt.py`.
 
-1. **Instructions in the system prompt.** `SYSTEM_PROMPT` (`prompt.py:21-34`) says the documents are untrusted reference material, that instructions inside them must not be followed, and that the model may say a document contains such text. It also requires answers to come only from the documents, with citations.
+1. **Instructions in the system prompt.** `SYSTEM_PROMPT` (`generation/prompt.py`) says the documents are untrusted reference material, that instructions inside them must not be followed, and that the model may say a document contains such text. It also requires answers to come only from the documents, with citations.
 
-2. **Delimited, escaped data blocks.** `build_user_prompt` (`prompt.py:37-43`) wraps each source in `<document index=... source=... title=...>`. Element text goes through `xml.sax.saxutils.escape`, so `<` and `&` in a document cannot close the tag or open a fake one. Attribute values go through `quoteattr`. The question is escaped the same way. The system prompt carries a cache breakpoint and the per-question documents come after it, so they never invalidate the stable prefix. The prompt is currently shorter than the API's minimum cacheable prefix, so the breakpoint has no effect yet (see the comment in `generation/claude.py`).
+2. **Delimited, escaped data blocks.** `build_user_prompt` wraps each source in `<document index=... source=... title=...>`. Element text goes through `xml.sax.saxutils.escape`, so `<` and `&` in a document cannot close the tag or open a fake one. Attribute values go through `quoteattr`. The question is escaped the same way. The Claude generator puts a cache breakpoint on the system prompt, but that breakpoint is **currently a no-op**: the prompt is below the API's minimum cacheable prefix (see the comment in `generation/claude.py`), so no prompt is cached yet.
 
-3. **Heuristic flagging.** `looks_like_injection` (`prompt.py:46-62`) matches a set of phrases: "ignore previous instructions", "reveal your system prompt", "you are now", "new instructions:", "developer mode", and tags such as `<system>`. `ask` counts flagged chunks in the metric `fastrag_injection_flags_total`, records their ids in the audit entry, and drops them when `FASTRAG_DROP_SUSPICIOUS_CHUNKS=true` (`service.py:209-214`). Confidence is recomputed after dropping, so a result that only had flagged evidence abstains (see `docs/architecture.md`).
+3. **Heuristic flagging.** `looks_like_injection` (`generation/prompt.py`) matches a set of phrases: "ignore previous instructions", "reveal your system prompt", "you are now", "new instructions:", "developer mode", and tags such as `<system>`. `RAGService.ask` checks the sources that passed the evidence gate, counts flagged chunks in `fastrag_injection_flags_total`, records their ids in the audit entry, and drops them when `FASTRAG_DROP_SUSPICIOUS_CHUNKS=true`. Abstention is decided after dropping, so a result that only had flagged evidence abstains (see `docs/architecture.md`).
 
-4. **Output checks.** `validate_citations` (`generation/citations.py`) removes text citation markers that point outside the shown sources. Generators return structured citations (`Generation.citations`), and the extractive generator uses them, so a passage that quotes "[2]" is not mistaken for a citation. Citations in the response are built only from the sources the model received. A model that is steered toward a source it was not shown cannot attach that source to the answer.
+4. **Output checks.** `validate_citations` (`generation/citations.py`) removes text citation markers that point outside the shown sources. Generators return structured citations (`Generation.citations`), and the extractive generator uses them, so a passage that quotes "[2]" is not mistaken for a citation. Citations in the response are built only from the sources the model received. An answer that cites nothing is marked `grounded: false`.
 
 ## What the layers protect against, and what they do not
 
 | Attack | Result |
 |---|---|
 | A document tries to change the caller's access | Not possible through the prompt. The model sees only documents the caller may read (ACL pre-filter, ADR 0002). |
-| A document tries to make the model cite a source it was not shown | The marker is removed (`citations.py:19-26`). |
-| A document tries to break out of its block with a closing tag | Escaped, so it stays inside the text (`prompt.py:39-40`). |
+| A document tries to make the model cite a source it was not shown | The marker is removed. |
+| A document tries to break out of its block with a closing tag | Escaped, so it stays inside the text. |
 | A document says "ignore the rules" in plain words | Flagged, counted and audited. Still sent to the LLM unless dropping is enabled. |
 | A paraphrase with no listed phrase ("disregard what came before this line") | **Not flagged.** The regex is a short list and produces false negatives by design. |
 | An injection that steers the answer's content, for example a false figure in an authoritative-sounding document | **Not detected.** The answer will quote the poisoned source with a valid citation. Only source curation and review catch this. |
@@ -40,6 +40,7 @@ Four layers, each in its own place. The prompt-injection boundary is documented 
 - The defense does not make the system safe for untrusted content. It keeps untrusted content from widening access, and it makes some attacks visible. Those are the limits of what it does.
 - The extractive generator (`generation/extractive.py`) has no instruction-following model at all, so an injection cannot change its behavior. It still displays document text verbatim, which a UI must render as plain text.
 - `POST /v1/search` returns raw chunk text, flagged or not. Injection defense applies only to `ask`.
+- `POST /v1/ask/stream` sends `delta` events as the model writes them, before citation validation. Only the final `answer` event is validated, and clients must treat deltas as untrusted text and replace them with that event.
 
 ## Alternatives considered
 

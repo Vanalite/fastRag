@@ -121,3 +121,31 @@ def test_k_zero_is_rejected(service, admin_a):
 
     with pytest.raises(InvalidInput):
         service.search(admin_a, "ok", 0)
+
+
+def test_user_limit_protects_colleagues(make_service, admin_a):
+    # One noisy user exhausts their own allowance; a colleague in the same tenant is fine.
+    svc = make_service(
+        rate_limit_per_minute=600, rate_limit_burst=100,
+        user_rate_limit_per_minute=1, user_rate_limit_burst=2,
+    )  # fmt: skip
+    noisy = make_principal(user="noisy")
+    quiet = make_principal(user="quiet")
+    svc.search(noisy, Q)
+    svc.search(noisy, Q)
+    with pytest.raises(RateLimited):
+        svc.search(noisy, Q)
+    svc.search(quiet, Q)
+
+
+def test_pii_in_questions_never_reaches_the_llm(service, generator, admin_a):
+    service.ingest(
+        admin_a,
+        doc("refunds.md", "If a card was charged twice, refunds are processed in ten days."),
+    )
+    reader = make_principal(user="r")
+    service.ask(reader, "My card 4111 1111 1111 1111 was charged twice, how are refunds processed?")
+    (question, _), *_ = generator.calls
+    assert "4111" not in question and "[REDACTED_CARD]" in question
+    entry = service.audit.sink.read()[-1]
+    assert entry["details"]["question_redactions"] == {"CARD": 1}
