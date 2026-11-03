@@ -2,7 +2,7 @@
 
 A running record of design decisions, with their reasons and the questions still open. Add a new entry for each new decision. If a decision is reversed, mark it superseded instead of deleting it.
 
-_Last updated: 2026-10-22_
+_Last updated: 2026-11-03_
 
 ## Context
 
@@ -168,6 +168,29 @@ _Last updated: 2026-10-22_
 
 - Expected pilot traffic: tens or thousands of customer conversations a day? This decides whether CPU embedding and a hosted reranker remain viable.
 
+- **Q12, pending answer.** What counts as "good enough to launch", and who maintains the reference questions? Proposed:
+  - **Three release checks:**
+    1. Access safety: zero internal content returned to the customer scope. This blocks a release.
+    2. Listing accuracy: 100% correct filters and value standardization on a fixed test set. This blocks a release.
+    3. Document retrieval quality: Recall@10 and MRR. Targets are set after the first baseline run against RAGFlow; after that, no release may score lower.
+  - **Who maintains the reference questions:** we draft them with an LLM from real customer chats, a sales person approves them in a review screen (about 30 minutes a week), and the set grows from hand-offs and thumbs-down feedback.
+
+## Proposed build order (not yet decided; confirm in the implementation session)
+1. **Project skeleton:** Python project, FastAPI service, Postgres with pgvector in Docker Compose, a worker process, lint, type-check and tests in CI. Update the Commands section of CLAUDE.md.
+2. **Data model:** tenants, collections, documents, chunks and listing tables, all carrying access groups (D7, D11, D12). Write access-safety tests first: customer scope never sees internal content.
+3. **Listings path:** Excel and Google Sheets import, column mapping with internal as the default, value standardization (prices, districts, areas), `query_listings` and lookup by ID returning `as_of` (D6, D8, D13).
+4. **Documents path:**
+   - parsing (docling, plus OCR for scans)
+   - Vietnamese pipeline: Unicode NFC, word segmentation, text with and without diacritics
+   - contextual chunking, BGE-M3 embeddings
+   - hybrid search with reciprocal rank fusion, then the hosted reranker
+   - evidence signals (D3, D5, D14)
+5. **Quality checks:** reference-question format, an evaluation command that reports Recall@10 and MRR, and a RAGFlow baseline run (D4, D10, Q12).
+6. **Sync:** Google Drive/Sheets connector, scheduled sync, content-hash comparison, webhook (D8).
+7. **Later:** the knowledge-graph layer, only if the quality checks justify it (D1).
+
 ## Next actions
 
 - [ ] Get sample documents and real customer questions from the pilot client.
+- [ ] Answer Q12 and the open questions above.
+- [ ] Start implementation locally at step 1 of the proposed build order.
