@@ -1,0 +1,15 @@
+{
+  "tenant_id": "northwind",
+  "documents": [
+    {"path": "travel-expense-policy.md", "acl": ["tenant:*"]},
+    {"path": "pto-policy.md", "acl": ["tenant:*"]},
+    {"path": "incident-response-runbook.md", "acl": ["tenant:*"]},
+    {"path": "vpn-setup-guide.md", "acl": ["tenant:*"]},
+    {"path": "oncall-rotation.md", "acl": ["tenant:*"]},
+    {"path": "code-review-guidelines.md", "acl": ["tenant:*"]},
+    {"path": "data-retention-policy.md", "acl": ["tenant:*"]},
+    {"path": "engineering-glossary.md", "acl": ["tenant:*"]},
+    {"path": "q3-board-summary.md", "acl": ["group:finance"]},
+    {"path": "compensation-bands.md", "acl": ["group:hr"]}
+  ]
+}
