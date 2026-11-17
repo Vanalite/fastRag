@@ -1,0 +1,81 @@
+# Districts used in Vietnamese real-estate listings.
+#
+# Codes follow the pre-July-2025 district layer, because listings, brochures
+# and customers still use those names after the 2025 administrative reform
+# removed districts. `parent` lets a filter on Thủ Đức include the former
+# Quận 2 and Quận 9. Tenants can add aliases per collection (settings.gazetteer).
+cities:
+  hcm:
+    names: ["Hồ Chí Minh", "TP.HCM", "TPHCM", "HCM", "Sài Gòn", "Saigon", "Ho Chi Minh City", "HCMC"]
+    districts:
+      hcm-q1: ["Quận 1", "Q1", "District 1"]
+      hcm-q3: ["Quận 3", "Q3", "District 3"]
+      hcm-q4: ["Quận 4", "Q4", "District 4"]
+      hcm-q5: ["Quận 5", "Q5", "District 5"]
+      hcm-q6: ["Quận 6", "Q6", "District 6"]
+      hcm-q7: ["Quận 7", "Q7", "District 7"]
+      hcm-q8: ["Quận 8", "Q8", "District 8"]
+      hcm-q10: ["Quận 10", "Q10", "District 10"]
+      hcm-q11: ["Quận 11", "Q11", "District 11"]
+      hcm-q12: ["Quận 12", "Q12", "District 12"]
+      hcm-thu-duc: ["Thủ Đức", "TP Thủ Đức", "Thành phố Thủ Đức", "Thu Duc City"]
+      hcm-q2: {aliases: ["Quận 2", "Q2", "District 2"], parent: hcm-thu-duc}
+      hcm-q9: {aliases: ["Quận 9", "Q9", "District 9"], parent: hcm-thu-duc}
+      hcm-binh-thanh: ["Bình Thạnh", "Quận Bình Thạnh", "Binh Thanh"]
+      hcm-go-vap: ["Gò Vấp", "Quận Gò Vấp"]
+      hcm-phu-nhuan: ["Phú Nhuận", "Quận Phú Nhuận"]
+      hcm-tan-binh: ["Tân Bình", "Quận Tân Bình"]
+      hcm-tan-phu: ["Tân Phú", "Quận Tân Phú"]
+      hcm-binh-tan: ["Bình Tân", "Quận Bình Tân"]
+      hcm-binh-chanh: ["Bình Chánh", "Huyện Bình Chánh"]
+      hcm-can-gio: ["Cần Giờ", "Huyện Cần Giờ"]
+      hcm-cu-chi: ["Củ Chi", "Huyện Củ Chi"]
+      hcm-hoc-mon: ["Hóc Môn", "Huyện Hóc Môn"]
+      hcm-nha-be: ["Nhà Bè", "Huyện Nhà Bè"]
+  hn:
+    names: ["Hà Nội", "HN", "Hanoi", "Ha Noi"]
+    districts:
+      hn-ba-dinh: ["Ba Đình", "Quận Ba Đình"]
+      hn-hoan-kiem: ["Hoàn Kiếm", "Quận Hoàn Kiếm"]
+      hn-tay-ho: ["Tây Hồ", "Quận Tây Hồ"]
+      hn-long-bien: ["Long Biên", "Quận Long Biên"]
+      hn-cau-giay: ["Cầu Giấy", "Quận Cầu Giấy"]
+      hn-dong-da: ["Đống Đa", "Quận Đống Đa"]
+      hn-hai-ba-trung: ["Hai Bà Trưng", "Quận Hai Bà Trưng"]
+      hn-hoang-mai: ["Hoàng Mai", "Quận Hoàng Mai"]
+      hn-thanh-xuan: ["Thanh Xuân", "Quận Thanh Xuân"]
+      hn-nam-tu-liem: ["Nam Từ Liêm", "Quận Nam Từ Liêm"]
+      hn-bac-tu-liem: ["Bắc Từ Liêm", "Quận Bắc Từ Liêm"]
+      hn-ha-dong: ["Hà Đông", "Quận Hà Đông"]
+      hn-son-tay: ["Sơn Tây", "Thị xã Sơn Tây"]
+      hn-dong-anh: ["Đông Anh", "Huyện Đông Anh"]
+      hn-gia-lam: ["Gia Lâm", "Huyện Gia Lâm"]
+      hn-thanh-tri: ["Thanh Trì", "Huyện Thanh Trì"]
+      hn-hoai-duc: ["Hoài Đức", "Huyện Hoài Đức"]
+      hn-soc-son: ["Sóc Sơn", "Huyện Sóc Sơn"]
+      hn-me-linh: ["Mê Linh", "Huyện Mê Linh"]
+      hn-thach-that: ["Thạch Thất", "Huyện Thạch Thất"]
+      hn-quoc-oai: ["Quốc Oai", "Huyện Quốc Oai"]
+      hn-chuong-my: ["Chương Mỹ", "Huyện Chương Mỹ"]
+      hn-thanh-oai: ["Thanh Oai", "Huyện Thanh Oai"]
+      hn-thuong-tin: ["Thường Tín", "Huyện Thường Tín"]
+      hn-dan-phuong: ["Đan Phượng", "Huyện Đan Phượng"]
+      hn-phuc-tho: ["Phúc Thọ", "Huyện Phúc Thọ"]
+      hn-ba-vi: ["Ba Vì", "Huyện Ba Vì"]
+      hn-my-duc: ["Mỹ Đức", "Huyện Mỹ Đức"]
+      hn-phu-xuyen: ["Phú Xuyên", "Huyện Phú Xuyên"]
+      hn-ung-hoa: ["Ứng Hòa", "Huyện Ứng Hòa"]
+  bd:
+    names: ["Bình Dương", "Binh Duong"]
+    districts:
+      bd-thu-dau-mot: ["Thủ Dầu Một", "TP Thủ Dầu Một"]
+      bd-di-an: ["Dĩ An", "TP Dĩ An"]
+      bd-thuan-an: ["Thuận An", "TP Thuận An"]
+      bd-ben-cat: ["Bến Cát"]
+      bd-tan-uyen: ["Tân Uyên"]
+  dn:
+    names: ["Đồng Nai", "Dong Nai"]
+    districts:
+      dn-bien-hoa: ["Biên Hòa", "TP Biên Hòa"]
+      dn-nhon-trach: ["Nhơn Trạch", "Huyện Nhơn Trạch"]
+      dn-long-thanh: ["Long Thành", "Huyện Long Thành"]

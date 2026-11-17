@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "my-self-hosted": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "my-provider",
+      "options": {
+        "baseURL": "http://100.70.90.125:8080/v1"
+      },
+      "models": {
+        "my-model-id": {
+          "name": "cat",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          }
+        }
+      }
+    }
+  }
+}

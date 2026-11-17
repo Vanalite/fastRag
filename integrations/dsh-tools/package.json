@@ -1,0 +1,32 @@
+{
+  "name": "@fastrag/dsh-tools",
+  "version": "0.1.0",
+  "description": "fastRag retrieval tools for DeepSeek Harness (dsh) and other @deepseek-ai/dsh-tools hosts.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "default": "./index.mjs"
+    },
+    "./plugin": {
+      "types": "./plugin.d.mts",
+      "default": "./plugin.mjs"
+    }
+  },
+  "files": ["index.mjs", "index.d.mts", "plugin.mjs", "plugin.d.mts", "README.md"],
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

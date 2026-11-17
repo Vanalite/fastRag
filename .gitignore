@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# fastRag local data (uploaded files, mounted sources)
+/data/

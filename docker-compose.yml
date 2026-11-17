@@ -1,0 +1,90 @@
+# fastRag: `cp .env.example .env`, set the tokens, then `docker compose up -d`.
+#
+# Services:
+#   db         Postgres 17 + pgvector (documents, chunks, listings, jobs)
+#   migrate    one-shot schema upgrade
+#   api        retrieval + admin HTTP API on port 8000 (keep it on the private network)
+#   worker     ingestion, sync scheduler (heavy, kept apart from the API, D9)
+#   embeddings BGE-M3 on CPU via text-embeddings-inference (D14)
+#   reranker   bge-reranker-v2-m3 on CPU; for the 300 ms customer target use a hosted
+#              reranker instead (set FASTRAG_RERANKER_PROVIDER=cohere|jina) and stop this one.
+#
+# The TEI CPU images are x86-64 only; on Apple Silicon they run emulated and slowly.
+x-fastrag: &fastrag
+  build: .
+  image: fastrag:latest
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    FASTRAG_DATABASE_URL: postgresql+asyncpg://fastrag:${POSTGRES_PASSWORD:-fastrag}@db:5432/fastrag
+    FASTRAG_EMBEDDING_URL: ${FASTRAG_EMBEDDING_URL:-http://embeddings:80}
+    FASTRAG_RERANKER_URL: ${FASTRAG_RERANKER_URL:-http://reranker:80}
+  volumes:
+    - files:/data/files
+    - ./data/sources:/data/sources:ro
+  restart: unless-stopped
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    # Size shared_buffers so the HNSW index and hot chunks fit in memory
+    # (about 25% of the host's RAM). See docs/operations.md.
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS:-1GB}", "-c", "effective_cache_size=${PG_EFFECTIVE_CACHE:-3GB}",
+              "-c", "work_mem=32MB", "-c", "maintenance_work_mem=512MB", "-c", "jit=off"]
+    environment:
+      POSTGRES_USER: fastrag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fastrag}
+      POSTGRES_DB: fastrag
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastrag -d fastrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *fastrag
+    command: ["fastrag", "migrate"]
+    restart: "no"
+    depends_on:
+      db: {condition: service_healthy}
+
+  api:
+    <<: *fastrag
+    command: ["fastrag", "serve", "--host", "0.0.0.0", "--port", "8000", "--workers", "${FASTRAG_API_WORKERS:-2}"]
+    ports:
+      - "${FASTRAG_API_BIND:-127.0.0.1}:8000:8000"
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  worker:
+    <<: *fastrag
+    command: ["fastrag", "worker", "--metrics-port", "9100"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    command: ["--model-id", "BAAI/bge-m3", "--max-client-batch-size", "64", "--auto-truncate"]
+    volumes:
+      - models:/data
+    restart: unless-stopped
+
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    platform: linux/amd64
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--auto-truncate"]
+    volumes:
+      - models:/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  files:
+  models:

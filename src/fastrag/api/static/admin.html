@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fastRag – Admin</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d232b; --muted:#647080; --line:#dfe3e8; --accent:#1f6feb; --ok:#1a7f37; --warn:#b35900; --bad:#c62828; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; gap:16px; align-items:center; padding:12px 20px; background:var(--card); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  nav button { background:none; border:0; padding:8px 10px; border-radius:6px; cursor:pointer; color:var(--muted); font:inherit; }
+  nav button.on { background:#e8f0fe; color:var(--accent); font-weight:600; }
+  main { max-width:1100px; margin:20px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:13px; }
+  input, select, textarea { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button.primary { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font:inherit; }
+  button.small { border:1px solid var(--line); background:#fff; border-radius:6px; padding:4px 9px; cursor:pointer; font:inherit; }
+  .muted { color:var(--muted); } .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; background:#eef1f4; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }
+  .stat b { display:block; font-size:22px; }
+  pre { white-space:pre-wrap; background:#f3f4f6; padding:10px; border-radius:6px; margin:6px 0; font-size:13px; }
+  #msg { position:fixed; bottom:16px; right:16px; background:#222; color:#fff; padding:10px 14px; border-radius:8px; display:none; max-width:420px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>fastRag</h1>
+  <nav id="tabs"></nav>
+  <div class="row" style="margin-left:auto">
+    <input id="token" type="password" placeholder="Admin token" size="28">
+    <input id="tenant" placeholder="Tenant (operator token only)" size="16">
+    <button class="small" id="save">Save</button>
+  </div>
+</header>
+<main id="view"></main>
+<div id="msg"></div>
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const store = { get: k => { try { return sessionStorage.getItem(k) || ""; } catch { return ""; } },
+                set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} } };
+$("#token").value = store.get("token"); $("#tenant").value = store.get("tenant");
+$("#save").onclick = () => { store.set("token", $("#token").value.trim()); store.set("tenant", $("#tenant").value.trim()); render(); };
+
+function toast(text, bad) { const m = $("#msg"); m.textContent = text; m.style.background = bad ? "#8b1c1c" : "#222"; m.style.display = "block"; setTimeout(() => m.style.display = "none", 4000); }
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ Authorization: "Bearer " + store.get("token") }, opts.headers || {});
+  if (store.get("tenant")) headers["X-Tenant"] = store.get("tenant");
+  if (opts.json !== undefined) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(opts.json); }
+  const r = await fetch(path, Object.assign({}, opts, { headers }));
+  if (r.status === 204) return null;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = data.error || data.detail || r.statusText; throw new Error(typeof e === "string" ? e : JSON.stringify(e)); }
+  return data;
+}
+
+const TABS = { overview: "Overview", upload: "Upload", review: "Review", mapping: "Sheet columns",
+               documents: "Documents", search: "Test search", jobs: "Jobs" };
+let current = "overview";
+function tabs() { $("#tabs").innerHTML = Object.entries(TABS).map(([k, v]) =>
+  `<button data-t="${k}" class="${k === current ? "on" : ""}">${v}</button>`).join("");
+  $("#tabs").querySelectorAll("button").forEach(b => b.onclick = () => { current = b.dataset.t; render(); }); }
+
+async function render() {
+  tabs();
+  const v = $("#view");
+  if (!store.get("token")) { v.innerHTML = `<div class="card">Enter your admin token at the top right, then click <b>Save</b>.</div>`; return; }
+  v.innerHTML = `<div class="card muted">Loading…</div>`;
+  try { await VIEWS[current](v); } catch (e) { v.innerHTML = `<div class="card bad">Error: ${esc(e.message)}</div>`; }
+}
+
+const VIEWS = {
+  async overview(v) {
+    const s = await api("/v1/admin/stats");
+    const d = s.documents || {};
+    const cell = (label, n, cls = "") => `<div class="card stat"><span class="muted">${label}</span><b class="${cls}">${n ?? 0}</b></div>`;
+    v.innerHTML = `<div class="stats">
+      ${cell("Documents ready", d.ready)}${cell("Spreadsheets imported", d.imported)}
+      ${cell("Needs review", (d.needs_review || 0) + (s.chunks_held_for_review ? ` (${s.chunks_held_for_review} passages)` : ""), (d.needs_review || s.chunks_held_for_review) ? "warn" : "")}
+      ${cell("Failed", d.failed, d.failed ? "bad" : "")}${cell("Passages indexed", s.chunks)}${cell("Listings", s.listings)}
+    </div><div class="card"><h2>Jobs</h2>${Object.entries(s.jobs || {}).map(([k, n]) => `<span class="pill">${esc(k)}: ${n}</span>`).join(" ") || "—"}</div>`;
+  },
+
+  async upload(v) {
+    const [sources, cols] = await Promise.all([api("/v1/admin/sources"), api("/v1/admin/collections")]);
+    const colName = Object.fromEntries(cols.map(c => [c.id, `${c.name} (${c.type === "listings" ? "listings" : "documents"})`]));
+    v.innerHTML = `<div class="card"><h2>Upload files</h2>
+      <p class="muted">Files in the <b>public</b> folder are visible to customers. Other folders are staff only.</p>
+      <div class="row">
+        <select id="src">${sources.filter(s => s.kind === "upload").map(s => `<option value="${s.id}">${esc(colName[s.collection_id] || s.name)}</option>`).join("")}</select>
+        <select id="folder"><option value="public">public – visible to customers</option><option value="">internal – staff only</option></select>
+        <input id="files" type="file" multiple accept=".pdf,.docx,.html,.htm,.md,.txt,.xlsx,.csv">
+        <button class="primary" id="go">Upload</button>
+      </div><div id="out"></div></div>`;
+    $("#go").onclick = async () => {
+      const files = $("#files").files; if (!files.length) return toast("Choose files first", true);
+      const out = $("#out"); out.innerHTML = "";
+      for (const f of files) {
+        const fd = new FormData(); fd.append("file", f); fd.append("path", $("#folder").value);
+        try { const r = await api(`/v1/admin/sources/${$("#src").value}/files`, { method: "POST", body: fd });
+          out.innerHTML += `<div class="ok">✓ ${esc(f.name)} – ${r.queued ? "processing" : "unchanged"} (${esc(r.groups.join(", "))})</div>`;
+        } catch (e) { out.innerHTML += `<div class="bad">✗ ${esc(f.name)}: ${esc(e.message)}</div>`; }
+      }
+    };
+  },
+
+  async review(v) {
+    const rows = await api("/v1/admin/review/chunks");
+    const label = { prompt_injection: "Possible instructions aimed at the AI", sensitive_in_public: "Sensitive information in a public file" };
+    v.innerHTML = `<div class="card"><h2>Passages hidden from customers (${rows.length})</h2>
+      <p class="muted">If a passage is safe for customers, click <b>Allow</b>. Otherwise fix the source file or move it to an internal folder.</p>
+      ${rows.length ? "" : `<p class="ok">Nothing to review.</p>`}
+      ${rows.map(r => `<div class="card"><div class="row"><b>${esc(r.title)}</b>
+        ${r.flags.map(f => `<span class="pill warn">${esc(label[f] || f)}</span>`).join(" ")}
+        <button class="small" style="margin-left:auto" data-id="${r.chunk_id}">Allow</button></div><pre>${esc(r.text)}</pre></div>`).join("")}</div>`;
+    v.querySelectorAll("button[data-id]").forEach(b => b.onclick = async () => {
+      await api("/v1/admin/review/chunks/clear", { method: "POST", json: { chunk_ids: [Number(b.dataset.id)] } });
+      toast("Allowed"); render(); });
+  },
+
+  async mapping(v) {
+    const cols = (await api("/v1/admin/collections")).filter(c => c.type === "listings");
+    if (!cols.length) { v.innerHTML = `<div class="card">No listings collection yet.</div>`; return; }
+    const FIELDS = { listing_code: "Listing code", title: "Title", project: "Project", property_type: "Property type", status: "Status",
+      price_vnd: "Price", price_per_m2_vnd: "Price per m²", area_m2: "Area", bedrooms: "Bedrooms", bathrooms: "Bathrooms",
+      direction: "Facing direction", city: "City/province", district_code: "District", ward: "Ward", address: "Address", description: "Description" };
+    let html = "";
+    for (const c of cols) {
+      for (const m of await api(`/v1/admin/mappings?collection=${encodeURIComponent(c.slug)}`)) {
+        html += `<div class="card" data-mapping="${m.id}"><h2>${esc(c.name)} ${m.confirmed ? `<span class="pill ok">confirmed</span>` : `<span class="pill warn">not confirmed – customers see no columns yet</span>`}</h2>
+          <table><tr><th>Spreadsheet column</th><th>Meaning</th><th>Price unit</th><th>Visible to customers?</th></tr>
+          ${m.headers.filter(h => h).map(h => { const e = m.columns[h] || { field: "attr:", groups: ["staff"] };
+            const isAttr = e.field.startsWith("attr:") || e.field === "ignore";
+            return `<tr data-h="${esc(h)}"><td><b>${esc(h)}</b></td>
+              <td><select class="f">${Object.entries(FIELDS).map(([k, l]) => `<option value="${k}" ${e.field === k ? "selected" : ""}>${l}</option>`).join("")}
+                <option value="${esc(isAttr && e.field !== "ignore" ? e.field : "attr:" + h.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/đ/g, "d").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""))}" ${isAttr && e.field !== "ignore" ? "selected" : ""}>Other information</option>
+                <option value="ignore" ${e.field === "ignore" ? "selected" : ""}>Ignore</option></select></td>
+              <td><select class="u"><option value="">auto-detect</option><option value="ty" ${e.unit === "ty" ? "selected" : ""}>billion</option><option value="trieu" ${e.unit === "trieu" ? "selected" : ""}>million</option></select></td>
+              <td><input type="checkbox" class="p" ${(e.groups || []).includes("public") ? "checked" : ""}></td></tr>`; }).join("")}
+          </table><div class="row" style="margin-top:10px"><button class="primary save">Save and confirm</button>
+          <span class="muted">Columns with internal information (floor price, commission, notes) should not be visible to customers.</span></div></div>`;
+      }
+    }
+    v.innerHTML = html || `<div class="card">No spreadsheets imported yet.</div>`;
+    v.querySelectorAll("[data-mapping]").forEach(card => $(".save", card).onclick = async () => {
+      const columns = {};
+      card.querySelectorAll("tr[data-h]").forEach(tr => { const u = $(".u", tr).value;
+        columns[tr.dataset.h] = Object.assign({ field: $(".f", tr).value, groups: $(".p", tr).checked ? ["public", "staff"] : ["staff"] }, u ? { unit: u } : {}); });
+      try { const r = await api(`/v1/admin/mappings/${card.dataset.mapping}`, { method: "PUT", json: { columns, confirmed: true } });
+        toast(`Saved. Re-importing ${r.reimport_queued} spreadsheet(s).`); render(); } catch (e) { toast(e.message, true); }
+    });
+  },
+
+  async documents(v) {
+    const docs = await api("/v1/admin/documents?limit=200");
+    const st = { ready: ["ready", "ok"], imported: ["imported", "ok"], needs_review: ["needs review", "warn"], failed: ["failed", "bad"],
+                 pending: ["pending", "muted"], processing: ["processing", "muted"], duplicate: ["duplicate", "muted"], deleted: ["deleted", "muted"] };
+    v.innerHTML = `<div class="card"><h2>Documents (${docs.length})</h2><table>
+      <tr><th>Name</th><th>Status</th><th>Visible to</th><th>Updated</th><th></th></tr>
+      ${docs.map(d => { const [t, c] = st[d.status] || [d.status, ""]; const w = (d.report && d.report.warnings) || [];
+        return `<tr><td>${esc(d.title)}<div class="muted">${esc(d.external_id)}</div>${d.error ? `<div class="bad">${esc(d.error)}</div>` : ""}${w.map(x => `<div class="warn">${esc(x)}</div>`).join("")}</td>
+        <td class="${c}">${t}</td><td>${d.groups.includes("public") ? "Customers + staff" : "Staff only"}</td>
+        <td class="muted">${esc((d.ingested_at || "").slice(0, 16).replace("T", " "))}</td>
+        <td>${d.status !== "deleted" ? `<button class="small" data-re="${d.id}">Reprocess</button> <button class="small" data-del="${d.id}">Delete</button>` : ""}</td></tr>`; }).join("")}
+      </table></div>`;
+    v.querySelectorAll("[data-re]").forEach(b => b.onclick = async () => { await api(`/v1/admin/documents/${b.dataset.re}/reindex`, { method: "POST" }); toast("Queued for reprocessing"); });
+    v.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => { if (!confirm("Remove this document from the index?")) return;
+      await api(`/v1/admin/documents/${b.dataset.del}`, { method: "DELETE" }); toast("Queued for deletion"); render(); });
+  },
+
+  async search(v) {
+    v.innerHTML = `<div class="card"><h2>Test search</h2><div class="row">
+      <input id="q" size="50" placeholder="Type a question">
+      <select id="pf"><option value="customer">As a customer</option><option value="internal_search">As staff</option></select>
+      <button class="primary" id="go">Search</button></div><div id="res"></div></div>`;
+    const run = async () => {
+      const r = await api("/v1/search", { method: "POST", json: { query: $("#q").value, profile: $("#pf").value } });
+      const s = r.signals;
+      $("#res").innerHTML = `<p class="${s.nothing_relevant ? "warn" : "ok"}">${s.nothing_relevant ? "Nothing relevant found" : "Found " + r.passages.length + " passage(s)"} · ${Math.round(r.timings_ms.total_ms)} ms · reranker: ${esc(s.reranker)}</p>
+        ${r.passages.map(p => `<div class="card"><div class="row"><b>${esc(p.source.title)}</b><span class="muted">${esc(p.heading || "")}</span>
+          <span class="pill" style="margin-left:auto">${(p.score ?? 0).toFixed(2)}</span></div><pre>${esc(p.text)}</pre></div>`).join("")}`;
+    };
+    $("#go").onclick = () => run().catch(e => toast(e.message, true));
+    $("#q").onkeydown = e => { if (e.key === "Enter") $("#go").click(); };
+  },
+
+  async jobs(v) {
+    const jobs = await api("/v1/admin/jobs?limit=100");
+    v.innerHTML = `<div class="card"><h2>Recent jobs</h2><table><tr><th>#</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Error</th><th></th></tr>
+      ${jobs.map(j => `<tr><td>${j.id}</td><td>${esc(j.kind)}</td><td class="${j.status === "failed" ? "bad" : j.status === "done" ? "ok" : ""}">${esc(j.status)}</td>
+        <td>${j.attempts}</td><td class="muted">${esc((j.last_error || "").split("\n")[0])}</td>
+        <td>${j.status === "failed" ? `<button class="small" data-retry="${j.id}">Retry</button>` : ""}</td></tr>`).join("")}</table></div>`;
+    v.querySelectorAll("[data-retry]").forEach(b => b.onclick = async () => { await api(`/v1/admin/jobs/${b.dataset.retry}/retry`, { method: "POST" }); toast("Queued"); render(); });
+  },
+};
+render();
+</script>
+</body>
+</html>
