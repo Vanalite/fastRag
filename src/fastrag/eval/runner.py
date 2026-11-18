@@ -12,6 +12,9 @@ Reference questions live in a JSONL file, one object per line:
      "expect_applied": {"price_max": 3500000000, "district": ["hcm-q7"]},
      "expect_ids": ["optional listing codes that must be returned"]}
 
+Generated questions (`fastrag eval-generate`) carry "status": "draft" until a
+person approves them; entries with status "draft" or "rejected" are not scored.
+
 Three release checks:
   1. Access safety: no customer-profile result may carry a group other than
      public. Blocks a release.
@@ -36,6 +39,9 @@ from fastrag.retrieval.profiles import effective_groups, resolve_profile
 from fastrag.retrieval.search import SearchRequest, search
 from fastrag.services import Services
 from fastrag.text.vietnamese import strip_diacritics
+
+# Reference entries that are kept in the file but not scored (D26).
+INACTIVE_STATUSES = frozenset({"draft", "rejected"})
 
 
 @dataclass
@@ -80,7 +86,8 @@ class EvalReport:
         }
 
 
-def load_references(path: str | Path) -> list[dict[str, Any]]:
+def read_references(path: str | Path) -> list[dict[str, Any]]:
+    """Every entry in the file, whatever its review status."""
     out = []
     for i, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
@@ -95,7 +102,13 @@ def load_references(path: str | Path) -> list[dict[str, Any]]:
     return out
 
 
-def _fold(s: str) -> str:
+def load_references(path: str | Path) -> list[dict[str, Any]]:
+    """The entries to score: unreviewed and rejected drafts are left out."""
+    return [r for r in read_references(path) if r.get("status") not in INACTIVE_STATUSES]
+
+
+def fold_text(s: str) -> str:
+    """Comparison form used for `contains`: no diacritics, case or spacing."""
     return " ".join(strip_diacritics(s).lower().split())
 
 
@@ -104,7 +117,7 @@ def matches(result: dict[str, Any], rel: dict[str, Any]) -> bool:
     if doc and doc not in (result.get("external_id"), result.get("title"), result.get("document_id")):
         return False
     contains = rel.get("contains")
-    return not (contains and _fold(contains) not in _fold(result.get("text", "")))
+    return not (contains and fold_text(contains) not in fold_text(result.get("text", "")))
 
 
 def score_ranked(results: list[dict[str, Any]], relevant: list[dict[str, Any]], k: int) -> tuple[float, float]:

@@ -132,6 +132,21 @@ fastrag calibrate pilot references.jsonl     # prints FASTRAG_RERANKER_CALIBRATI
 
 Measured so far (design log D21, D22): with BGE-M3 and bge-reranker-v2-m3, held-out Recall@10 is 0.875, and database-side latency for customer searches at 50,000 chunks is 68 ms (p95). Run `scripts/bench_search.py` to measure your own hardware. Thumbs-down feedback (`POST /v1/feedback`) and hand-offs are logged with their trace ID, and `GET /v1/admin/search-logs?feedback=down` lists them as candidate reference questions.
 
+### Drafting reference questions
+
+If you don't have a reference set yet, draft one from your documents and approve it:
+
+```bash
+fastrag eval-generate pilot docs --out references.jsonl --dry-run   # sample size and cost estimate, no LLM call
+fastrag eval-generate pilot docs --out references.jsonl --count 50 --unanswerable 5
+fastrag eval-review references.jsonl                                # approve, edit or reject each question
+fastrag eval pilot references.jsonl
+```
+
+Drafts are not scored until someone approves them. Each one comes with its source passage and the exact text that answers it, and proposals whose quote isn't really in the passage are thrown away. Review stops and resumes at any point, and running `eval-generate` again adds new questions from passages not used yet.
+
+The LLM receives passages from ready documents in `--groups` (default `public,staff`). Passages flagged for prompt injection, personal data or internal terms are never sent. Questions drafted from documents tend to be easier than real ones, so add real customer questions to the same file as you collect them.
+
 ## Loading a large corpus
 
 Every document goes through the same steps: parse, OCR scanned pages, normalize the Vietnamese text, chunk, add context to each chunk, flag problems, then index it for keyword and vector search. Each documents collection can choose how parsing, chunking and context work. Here is a typical workflow:

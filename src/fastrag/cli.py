@@ -336,8 +336,10 @@ def eval_cmd(
 ) -> None:
     """Run the release checks against a reference question file. Exits 1 if a check fails."""
     from fastrag.db.engine import dispose_engine, get_sessionmaker
-    from fastrag.eval.runner import load_references, run_eval
+    from fastrag.eval.runner import run_eval
     from fastrag.services import build_services
+
+    refs = _load_refs(references)
 
     async def main() -> bool:
         services = build_services()
@@ -348,7 +350,7 @@ def eval_cmd(
                 get_sessionmaker(),
                 services,
                 tid,
-                load_references(references),
+                refs,
                 k,
                 str(baseline) if baseline else None,
             )
@@ -373,15 +375,16 @@ def calibrate(tenant: str, references: Path) -> None:
     FASTRAG_RERANKER_CALIBRATION value to use."""
     from fastrag.db.engine import dispose_engine, get_sessionmaker
     from fastrag.eval.calibrate import collect_pairs, fit_platt, summarize
-    from fastrag.eval.runner import load_references
     from fastrag.services import build_services
+
+    refs = _load_refs(references)
 
     async def main() -> None:
         services = build_services()
         try:
             async with get_sessionmaker()() as s:
                 tid = await _tenant_id(s, tenant)
-            pairs = await collect_pairs(get_sessionmaker(), services, tid, load_references(references))
+            pairs = await collect_pairs(get_sessionmaker(), services, tid, refs)
             if sum(y for _, y in pairs) < 3 or len(pairs) - sum(y for _, y in pairs) < 3:
                 typer.echo("not enough labelled candidates; add more reference questions", err=True)
                 raise typer.Exit(1)
@@ -514,6 +517,21 @@ async def _find_collection(session: Any, tenant: str, slug: str) -> Any:
 
 def _progress(line: str) -> None:
     typer.echo(line, err=True)
+
+
+def _load_refs(path: Path) -> list[dict[str, Any]]:
+    """Reference questions to score. Unapproved drafts are skipped, and saying
+    so keeps a file of drafts from passing the checks with nothing measured."""
+    from fastrag.eval.runner import load_references, read_references
+
+    refs = load_references(path)
+    skipped = len(read_references(path)) - len(refs)
+    if skipped:
+        typer.echo(f"{path}: skipped {skipped} draft or rejected question(s)", err=True)
+        if not refs:
+            typer.echo(f"nothing to score; approve questions with: fastrag eval-review {path}", err=True)
+            raise typer.Exit(2)
+    return refs
 
 
 @app.command("ingest-settings")
@@ -735,12 +753,11 @@ def compare(
     difference. Adopt the winner with `fastrag ingest-settings --set`."""
     from fastrag.db.engine import dispose_engine, get_sessionmaker
     from fastrag.eval.compare import compare_settings
-    from fastrag.eval.runner import load_references
     from fastrag.ingest.settings import IngestSettingsError, merge_settings, resolve_ingest
     from fastrag.services import build_services
 
     overrides = _json_option(set_, "--set")
-    refs = load_references(references)
+    refs = _load_refs(references)
 
     async def main() -> dict[str, Any] | None:
         services = build_services()
@@ -813,3 +830,97 @@ def drop_trial_cmd(tenant: str, collection: str) -> None:
 
 if __name__ == "__main__":
     app()
+
+
+@app.command("eval-generate")
+def eval_generate(
+    tenant: str,
+    collection: str,
+    out: Path = typer.Option(..., help="Reference file to add the drafts to. Existing entries are kept."),
+    count: int = typer.Option(50, min=1, max=2000, help="Answerable questions to draft."),
+    unanswerable: int = typer.Option(5, min=0, max=500, help="Questions the documents should not answer."),
+    per_document: int = typer.Option(3, min=1, max=100, help="Passages tried per document."),
+    groups: str = typer.Option("public,staff", help="Only passages visible to these groups go to the LLM."),
+    min_tokens: int = typer.Option(20, min=1, help="Skip passages shorter than this."),
+    seed: int = typer.Option(7, help="Passage sampling seed."),
+    llm: str = typer.Option(None, help="LLM provider name. Default: the collection's context LLM."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the sample and cost estimate; call no LLM."),
+) -> None:
+    """Draft reference questions from a documents collection with an LLM. Drafts
+    are not scored until approved with `fastrag eval-review`."""
+    from fastrag.db.engine import dispose_engine, get_sessionmaker
+    from fastrag.eval.generate import GenerateOptions, append_references, generate_references
+    from fastrag.eval.runner import read_references
+    from fastrag.services import build_services
+
+    options = GenerateOptions(
+        count=count,
+        unanswerable=unanswerable,
+        per_document=per_document,
+        groups=tuple(g.strip() for g in groups.split(",") if g.strip()),
+        min_tokens=min_tokens,
+        seed=seed,
+        llm=llm,
+    )
+    existing = read_references(out) if out.exists() else []
+
+    async def main() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        services = build_services()
+        sm = get_sessionmaker()
+        try:
+            async with sm() as s:
+                tid = await _tenant_id(s, tenant)
+            return await generate_references(
+                sm, services, tid, collection, options, existing=existing, dry_run=dry_run, progress=_progress
+            )
+        except (LookupError, ValueError, RuntimeError) as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(2) from exc
+        finally:
+            await services.aclose()
+            await dispose_engine()
+
+    records, summary = _run(main())
+    if not dry_run:
+        append_references(out, records)
+        summary["out"] = str(out)
+    _print(summary)
+    if records:
+        typer.echo(f"\nReview the drafts: fastrag eval-review {out}", err=True)
+
+
+@app.command("eval-review")
+def eval_review(references: Path) -> None:
+    """Approve, edit or reject drafted reference questions, one at a time. Each
+    decision is saved at once, so you can stop and continue later."""
+    from fastrag.eval.generate import Decision, review_references, source_label
+
+    def decide(item: dict[str, Any], position: int, total: int) -> Decision:
+        origin = item.get("origin") or {}
+        place = source_label(origin.get("title"), origin.get("heading"))
+        typer.echo(f"\n[{position}/{total}] {item['id']}  profile={item.get('profile', 'customer')}")
+        typer.echo(f"Source:   {place or origin.get('document', '?')}")
+        typer.echo(f"Question: {item['query']}")
+        if item.get("expect_nothing"):
+            typer.echo("Expected: the documents do NOT answer this. Reject it if they do.")
+        else:
+            typer.echo(f"Answer:   {item['relevant'][0].get('contains', '')}")
+        typer.echo(f"Passage:  {origin.get('passage', '')}")
+        while True:
+            choice = typer.prompt("[a]pprove, [e]dit, [r]eject, [s]kip, [q]uit", default="s").strip().lower()[:1]
+            if choice == "a":
+                return Decision("approve")
+            if choice == "r":
+                return Decision("reject")
+            if choice == "s":
+                return Decision("skip")
+            if choice == "q":
+                return Decision("quit")
+            if choice == "e":
+                return Decision("approve", typer.prompt("Question", default=item["query"]).strip())
+
+    try:
+        _print(review_references(references, decide))
+    except (OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc

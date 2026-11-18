@@ -276,6 +276,16 @@ _Last updated: 2026-11-07_
   - Speculative chunking strategies such as semantic or fixed windows.
   - Re-processing on every deployment-default change: that could run up LLM costs without warning.
 
+### D26. Reference questions can be drafted from the documents, but only people approve them (decided 2026-11-18, implementation)
+- **Context:** Q12 proposes LLM-drafted reference questions that a person approves. Without a reference set, `eval`, `calibrate` and `compare` have nothing to measure.
+- **Decision:** `fastrag eval-generate` samples passages and asks an LLM for a question plus the exact text that answers it. It writes drafts into the normal reference file. `fastrag eval-review` approves, edits or rejects them one at a time.
+- **Drafts are never scored.** Entries with `status` `draft` or `rejected` are skipped by `eval`, `calibrate` and `compare`. A file with nothing else is an error, so it cannot pass the release checks by measuring nothing.
+- **Checks that do not rely on the LLM:** the quote must be in the passage (same comparison as `contains` at scoring time), the question must not contain the quote or copy the passage, and it must not refer to "this document".
+- **What reaches the LLM:** only passages from `ready` documents, in the requested groups (default `public,staff`), with no hygiene flags. Flagged passages may hold prompt injection or personal data.
+- **Coverage:** passages are picked round-robin across documents with a seed, so long documents cannot fill the set. Internal passages get the `internal_search` profile, because the customer scope cannot find them.
+- **Growing the set:** a new run appends. It skips passages and questions already in the file, including rejected ones, and existing lines are not changed.
+- **Limits:** questions drafted from documents test wording that follows the documents, so they tend to be easier than real customer questions. Q12's real chats, hand-offs and thumbs-down feedback remain the better source and should be added to the same file. "Unanswerable" drafts are the LLM's guess until a reviewer confirms that no document answers them.
+
 ## Open questions
 
 - Does each project have one master sheet, or does each sales person keep their own copy? Separate copies would require deduplication and choosing which copy wins.

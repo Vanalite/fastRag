@@ -156,7 +156,7 @@ def resolve_ingest(
         raise IngestSettingsError("ingest.parser: docling is not installed (install the `docling` extra)")
 
     mode = cx.mode or "auto"
-    llm = _pick_llm(services, cx.llm)
+    llm = pick_llm(services, cx.llm)
     if cx.llm and llm is None:
         message = f"ingest.context.llm: no LLM provider named {cx.llm!r}; configured: {_names(services)}"
         if strict:
@@ -215,7 +215,7 @@ def _all_llms(services: Services) -> dict[str, ChatLLM]:
     return llms
 
 
-def _pick_llm(services: Services, name: str | None) -> ChatLLM | None:
+def pick_llm(services: Services, name: str | None) -> ChatLLM | None:
     llms = _all_llms(services)
     if name:
         return llms.get(name)
